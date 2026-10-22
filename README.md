@@ -1,8 +1,9 @@
-# MegaMoE based on DeepGEMM (H20 / B200)
+# MegaMoE based on DeepGEMM (H20 / B200 / SM120)
 
 Expert-parallel MoE layer kernels for decode-size batches, built on DeepGEMM: four explicit
-Hopper/H20 APIs plus one shared Fable dynamic-M frontend, and the Blackwell/B200 kernels under
-`sm100_b200/`. Split and Fused retain independent workspaces, layouts, schedulers, and ABI contracts.
+Hopper/H20 APIs plus one shared Fable dynamic-M frontend, the Blackwell/B200 kernels under
+`sm100_b200/`, and the SM120 (RTX PRO 6000 / 6000D) EP and TP decode kernels (`mxfp4_mega_moe_sm120`,
+`mxfp4_moe_tp_sm120`). Split and Fused retain independent workspaces, layouts, schedulers, and ABI contracts.
 
 Best measured MegaMoE kernel time (single kernel, forced-balanced, E384 / H3072 / I1280 / top-8 / EP8,
 GPU 0, median of the last 3 of 30 streamed replays, µs at global M = 2 / 4 / 8 / 16; full tables in
@@ -299,6 +300,15 @@ kernel, with the forced-balanced routing written by one memcpy node in between (
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
+SM120 is measured at a different scale (DeepSeek-V4-Flash: E256, H4096, I2048, top-6; PCIe P2P, no NVLink), so it is not
+in the table above. MoE layer time on 8x RTX 6000D, µs, against vLLM's Marlin MXFP4 MoE on the same layout
+([docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md), which also has vLLM decode with the real weights):
+
+| Layout | Kernel | T = 1 | 2 | 8 | 16 |
+|---|---|---:|---:|---:|---:|
+| EP4, T tokens per rank | `mxfp4_mega_moe_sm120` / Marlin + AG/RS | 123 / 151 | 165 / 217 | 363 / 459 | 536 / 679 |
+| TP8, T global tokens, cold L2 | `mxfp4_moe_tp_sm120` / Marlin | 33.5 / 57 | 42 / 61 | 103 / 112 | 158 / 177 |
+
 ## Relevant source files
 
 ```text
@@ -315,6 +325,10 @@ deep_gemm/include/deep_gemm/impls/fable_cc_select.cuh
 deep_gemm/include/deep_gemm/impls/sm90_mxfp4_mega_moe.cuh
 deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh
 deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused_body.inl
+deep_gemm/include/deep_gemm/impls/sm120_mxfp4_mega_moe.cu
+deep_gemm/mega/sm120.py
+tests/test_mega_moe_sm120.py
+sm120_6000d/vllm/
 tests/test_fable_frontend_correctness.py
 tests/test_four_api_smoke.py
 tests/test_four_api_correctness.py

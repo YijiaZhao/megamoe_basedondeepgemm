@@ -24,8 +24,9 @@ DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
 
-# Compiler flags
-cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
+# Compiler flags (PyTorch >= 2.10 headers require C++20)
+cpp_std = 'c++20' if parse(torch.__version__.split('+')[0]) >= parse('2.10') else 'c++17'
+cxx_flags = [f'-std={cpp_std}', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
@@ -111,7 +112,7 @@ def get_ext_modules():
                           library_dirs=build_library_dirs,
                           extra_compile_args={
                               'cxx': cxx_flags,
-                              'nvcc': ['-O3', '-std=c++17',
+                              'nvcc': ['-O3', f'-std={cpp_std}',
                                        f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}'],
                           })]
 
