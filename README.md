@@ -300,14 +300,11 @@ kernel, with the forced-balanced routing written by one memcpy node in between (
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
-SM120 is measured at a different scale (DeepSeek-V4-Flash: E256, H4096, I2048, top-6; PCIe P2P, no NVLink), so it is not
-in the table above. MoE layer time on 8x RTX 6000D, µs, against vLLM's Marlin MXFP4 MoE on the same layout
-([docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md), which also has vLLM decode with the real weights):
-
-| Layout | Kernel | T = 1 | 2 | 8 | 16 |
-|---|---|---:|---:|---:|---:|
-| EP4, T tokens per rank | `mxfp4_mega_moe_sm120` / Marlin + AG/RS | 123 / 151 | 165 / 217 | 363 / 459 | 536 / 679 |
-| TP8, T global tokens, cold L2 | `mxfp4_moe_tp_sm120` / Marlin | 33.5 / 57 | 42 / 61 | 103 / 112 | 158 / 177 |
+SM120 (8x RTX 6000D, PCIe P2P, no NVLink; CUDA-event timing, so not in the nsys table above), against vLLM's Marlin
+MXFP4 MoE with NCCL all-gather / reduce-scatter on the same layout: the EP kernel's MoE layer is 21-29 % shorter on
+DeepSeek-V4-Flash EP4 (1-64 tokens per rank) and 1.6-2.2x faster on this README's shape at EP8 with cold L2; in Toklin
+CI AgentX the PD layout with the kernel on its DP4/EP4 decode worker gains 6-8 % throughput and 9-13 % ITL at CC32-80.
+Tables, per-phase stamps and the TP kernel: [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md).
 
 ## Relevant source files
 

@@ -15,6 +15,7 @@ import os
 import torch
 
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context
 
 _EXT = None
 _INIT_KEY = None
@@ -62,7 +63,9 @@ class KzSm120MegaMoe:
         H, I = half_h * 2, two_i // 2
         assert H == moe.hidden_dim and w2.shape == (E_local, H, I // 2), (w13.shape, w2.shape)
         top_k = moe.experts_per_token
-        cap = moe.max_num_tokens
+        # tokens per rank per call the peer buffers hold (decode batches); KZ_SM120_EP_TCAP caps vLLM's
+        # max_num_tokens so the buffers do not eat the decode worker's KV pool
+        cap = min(moe.max_num_tokens, int(os.environ.get("KZ_SM120_EP_TCAP", "512")))
         key = (ep.rank_in_group, ep.world_size, E_local, cap, H, I, top_k)
         global _INIT_KEY
         if _INIT_KEY is None:
@@ -82,21 +85,31 @@ class KzSm120MegaMoe:
         self.limit = float(moe.swiglu_limit) if moe.swiglu_limit is not None else 3.0e38
         self.cap = cap
 
+    def _run(self, x, ids, w, out):
+        _ext().run(x, ids, w, out, self.w13, self.ws13, self.w2, self.ws2, self.limit, None)
+
     def __call__(self, hidden_states, topk_ids, topk_weights):
-        assert hidden_states.shape[0] <= self.cap
-        out = torch.empty_like(hidden_states, dtype=torch.bfloat16)
-        _ext().run(
-            hidden_states.to(torch.bfloat16).contiguous(),
-            topk_ids.to(torch.int32).contiguous(),
-            topk_weights.to(torch.float32).contiguous(),
-            out,
-            self.w13,
-            self.ws13,
-            self.w2,
-            self.ws2,
-            self.limit,
-            None,
-        )
+        x = hidden_states.to(torch.bfloat16).contiguous()
+        ids = topk_ids.to(torch.int32).contiguous()
+        w = topk_weights.to(torch.float32).contiguous()
+        out = torch.empty_like(x)
+        T = x.shape[0]
+        # the kernel is collective: every rank makes the same number of calls, set by the largest rank's tokens
+        dpm = get_forward_context().dp_metadata
+        tmax = max(T, int(dpm.num_tokens_across_dp_cpu.max())) if dpm is not None else T
+        if tmax <= self.cap:
+            self._run(x, ids, w, out)
+            return out
+        # more tokens than the buffers hold (profile run, an eager prefill-sized batch): cap-sized calls; a rank out
+        # of tokens sends one row routed nowhere (id -1)
+        idle_x, idle_ids, idle_w = x[:1], torch.full_like(ids[:1], -1), w[:1]
+        idle_out = torch.empty_like(idle_x)
+        for s in range(0, tmax, self.cap):
+            e = min(s + self.cap, T)
+            if s < T:
+                self._run(x[s:e], ids[s:e], w[s:e], out[s:e])
+            else:
+                self._run(idle_x, idle_ids, idle_w, idle_out)
         return out
 
     def kernel_weights(self):

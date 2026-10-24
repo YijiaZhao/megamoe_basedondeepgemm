@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     // L1: [tok][kRowsPerItem/2 inter] / L2: [tok][kRowsPerItem hidden] / dispatch: one MXFP8 token row (H + H/32 bytes)
     __shared__ __align__(16) float s_tile[kTile][kRowsPerItem < 256 ? 256 : kRowsPerItem];
 
-    unsigned long long st_[16] = {gtime()};  // +8 route-push 9 route-ok 10 map 11 pf 12 flag-sent  // 0 start 1 pushed 2 flags 3 work end 4 comb flags 5 end 6 L1-wait ns 7 items
+    unsigned long long st_[16] = {gtime()};  // +8 route-push 9 route-ok 10 map 11 pf 12 flag-sent 13 last FC1 end 14 first FC2 start 15 comb-flag release  // 0 start 1 pushed 2 flags 3 work end 4 comb flags 5 end 6 L1-wait ns 7 items
     if (threadIdx.x == 0) s_epoch = *reinterpret_cast<volatile int *>(a.ctr + kCtrEpoch) + 1;
     __syncthreads();
     const int epoch = s_epoch;
@@ -469,6 +469,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
                 }
                 __syncthreads();
                 st_[6] += gtime() - tw0;
+                if (!st_[14]) st_[14] = gtime();
                 if (!s_ok) goto exit_kernel;
             }
 
@@ -513,6 +514,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
                 __threadfence();
                 __syncthreads();
                 if (threadIdx.x == 0) atomicAdd(ctr + kCtrL1 + el, 1);
+                st_[13] = gtime();
             } else {
                 const size_t r = size_t(el) * TOKE + j;
                 item_gemm(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, H / 16, nb0, I, a.inter + r * I,
@@ -552,6 +554,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
                     if (done == n2 - 1) {  // this rank's last FC2 item: tell every source rank
                         __threadfence_system();
                         for (int w = 0; w < W; ++w) st_release_sys(a.peers.comb_flag[w] + a.rank, epoch);
+                        st_[15] = gtime();
                     }
                 }
             }
