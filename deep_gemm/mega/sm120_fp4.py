@@ -7,7 +7,7 @@
 #     value on every rank, e.g. the max over experts).
 #   * 'w4a8': MXFP4 weights x MXFP8 activations (E4M3, UE8M0 scale per 32): the formats of `sm120.py`, on this
 #     kernel's dataflow.
-# The dataflow is that of the W4A8 kernel (`sm120.py`, unchanged): the dispatch quantizes each token once and pushes
+# Dataflow: the dispatch quantizes each token once and pushes
 # its top-k copies into the owners' expert pools, FC1 + SwiGLU + FC2 run as swap-AB `mma.sync kind::mxf4nvf4`
 # m16n8k64, the bf16 partials go back to the source rank and are combined there. Epoch-tagged flags, no cross-rank
 # barriers, CUDA-graph safe. One buffer per format per process.

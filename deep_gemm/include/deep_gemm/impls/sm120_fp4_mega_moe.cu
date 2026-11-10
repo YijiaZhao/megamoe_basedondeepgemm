@@ -1,7 +1,7 @@
 /**
  * SM120 decode MegaMoE, W4A4 (FP4 weights x FP4 activations) and W4A8 (MXFP4 weights x MXFP8 activations), EP over
  * PCIe P2P, one persistent kernel per rank.
- * Same dataflow as the W4A8 kernel (sm120_mxfp4_mega_moe.cu, unchanged): dispatch (FP4 quant + P2P push) -> FC1 +
+ * Dataflow: dispatch (FP4 quant + P2P push) -> FC1 +
  * SwiGLU (swap-AB mma.sync) -> FC2 -> P2P push back -> top-k combine, epoch-tagged flags, no cross-rank barriers.
  * One format per build (SM120_FP4_NV):
  *   0 MXFP4: E2M1, UE8M0 scale per 32 values; mma.sync kind::mxf4nvf4 scale_vec::2X m16n8k64.

@@ -4,7 +4,7 @@
 #       readme: the README shape H3072 / I1280 / E384 / top-8)
 #   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 1024
 #       README shape and method, global M tokens (TILE=8/16/24/32 forces the tokens per item); `w4a8` is this
-#       kernel with MXFP8 activations, `w4a8_old` the kernel of sm120.py; `stamps` instead of `bench` prints the
+#       kernel with MXFP8 activations; `stamps` instead of `bench` prints the
 #       per-phase kernel stamps
 # The reference applies the kernel's quantization to the activations and to the SwiGLU output:
 #   MXFP4: per 32, scale 2^ceil(log2(amax/6)), E2M1 round-to-nearest-even.
@@ -166,16 +166,11 @@ def bench(fmt, rank, world, group, ms, stamps=False):
     l2 = (w2, torch.full((el, h, i // vec), sf, device='cuda', dtype=torch.uint8))
     cap = max(max(1, m // world) for m in ms)
     tile = int(os.environ.get('TILE', '0'))
-    if fmt == 'w4a8_old':
-        mod = _load('sm120')
-        buf = mod.Sm120MegaMoeBuffer(group, e, cap, topk, h, i)
-        run_fn = lambda y, x, ids, w: mod.mxfp4_mega_moe_sm120(y, x, ids, w, l1, l2, buf, activation_clamp=LIMIT)
-    else:
-        gs = fp4.nvfp4_global_scales(A1, A2, torch.full((el,), 0.06, device='cuda'),
-                                     torch.full((el,), 0.06, device='cuda')) if fmt == 'nvfp4' else None
-        buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, cap, topk, h, i)
-        run_fn = lambda y, x, ids, w, st=None: fp4.fp4_mega_moe_sm120(y, x, ids, w, l1, l2, buf, gs,
-                                                                      activation_clamp=LIMIT, tile_tokens=tile, stamps=st)
+    gs = fp4.nvfp4_global_scales(A1, A2, torch.full((el,), 0.06, device='cuda'),
+                                 torch.full((el,), 0.06, device='cuda')) if fmt == 'nvfp4' else None
+    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, cap, topk, h, i)
+    run_fn = lambda y, x, ids, w, st=None: fp4.fp4_mega_moe_sm120(y, x, ids, w, l1, l2, buf, gs,
+                                                                  activation_clamp=LIMIT, tile_tokens=tile, stamps=st)
     flush = torch.empty(256 << 20, dtype=torch.uint8, device='cuda')
     for m in ms:
         rows = max(1, m // world)
@@ -273,7 +268,7 @@ def main():
     dist.init_process_group('nccl', device_id=torch.device('cuda', local_rank))
     rank, world = dist.get_rank(), dist.get_world_size()
     if rank == 0:  # build once before the other ranks load it
-        _load('sm120')._ext() if fmt == 'w4a8_old' else fp4._ext(fmt)
+        fp4._ext(fmt)
     dist.barrier()
     if mode == 'verify':
         verify(fmt, args[0] if args else 'small', rank, world, dist.group.WORLD)
