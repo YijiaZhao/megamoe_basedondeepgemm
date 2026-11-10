@@ -896,6 +896,7 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     if (tile_tokens <= 0) {
         const float per_expert = float(a.T) * a.TOPK / a.EL;
         nt = max(1, min(kMaxNt, int(ceilf(per_expert / 4.f))));  // swept on 6000D EP8: 8 / 16 / 24 / 32 at T 16 / 32 / 64 / 128
+        if (kA8) nt = per_expert > 8.f && per_expert <= 16.f ? 2 : 1;  // W4A8 (two MMAs per K64), same sweep: 16 at T 64, else 8
     }
     TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8, 16, 24 or 32");
     auto stream = c10::cuda::getCurrentCUDAStream();
