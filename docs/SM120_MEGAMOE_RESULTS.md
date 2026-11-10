@@ -77,8 +77,8 @@ H20 / B200 rows for the same shape are in the README table.
 | Marlin + AG/RS, warm L2 | 112.6 | 110.6 | 112.6 | 110.6 |
 | `mxfp4_mega_moe_sm120`, cold L2 | 60.9 | 75.1 | 92.5 | 128.4 |
 | new kernel, W4A8 (`fp4_mega_moe_sm120`, `'w4a8'`), cold L2 | **44.8** | **60.1** | **78.0** | **128.9** |
-| new kernel, W4A4 MXFP4, cold L2 | 50.8 | 67.3 | 80.8 | 129.1 |
-| new kernel, W4A4 NVFP4, cold L2 | 62.9 | 75.0 | 88.4 | 142.2 |
+| new kernel, W4A4 MXFP4, cold L2 | 45.3 | 61.2 | 78.2 | 129.5 |
+| new kernel, W4A4 NVFP4, cold L2 | 47.7 | 63.6 | 82.7 | 136.7 |
 | Marlin + AG/RS, cold L2 | 134.3 | 141.0 | 162.8 | 203.6 |
 
 Cold L2 is what a decode step sees (43 layers of weights per step, far beyond the L2): 2.2x / 1.9x / 1.8x / 1.6x
