@@ -182,18 +182,23 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
 #pragma unroll
         for (int s = 0; s < NT; ++s) acc[j][s][0] = acc[j][s][1] = acc[j][s][2] = acc[j][s][3] = 0.f;
     constexpr int kSw = kNv ? kUnroll : kUnroll / 2;  // scale words per unrolled step
-#pragma unroll 2  // two steps of loads in flight; left to the compiler it is not unrolled (≈ 10 µs slower at M2)
-    for (int k0 = 0; k0 < kch; k0 += kUnroll) {
-        uint4 wv[kNbPerWarp][kUnroll];
+    // double-buffered: the next step's weights and scales are in flight while this step's MMAs run (cold L2: the
+    // loop is bound by DRAM latency, and the compiler does not reliably hoist the loads by itself)
+    uint4 wv[kNbPerWarp][kUnroll], wn[kNbPerWarp][kUnroll];
+    uint32_t sfa[kNbPerWarp][kSw], sfn[kNbPerWarp][kSw];
+    auto load = [&](int k0, uint4 (&w)[kNbPerWarp][kUnroll], uint32_t (&sf)[kNbPerWarp][kSw]) {
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u)
 #pragma unroll
-            for (int j = 0; j < kNbPerWarp; ++j) wv[j][u] = __ldcs(wp[j] + (k0 + u) * 32);
-        uint32_t sfa[kNbPerWarp][kSw];
+            for (int j = 0; j < kNbPerWarp; ++j) w[j][u] = __ldcs(wp[j] + (k0 + u) * 32);
 #pragma unroll
         for (int q = 0; q < kSw; ++q)
 #pragma unroll
-            for (int j = 0; j < kNbPerWarp; ++j) sfa[j][q] = __ldg(sp[j] + (k0 * kSw / kUnroll + q) * 16);
+            for (int j = 0; j < kNbPerWarp; ++j) sf[j][q] = __ldg(sp[j] + (k0 * kSw / kUnroll + q) * 16);
+    };
+    load(0, wv, sfa);
+    for (int k0 = 0; k0 < kch; k0 += kUnroll) {
+        if (k0 + kUnroll < kch) load(k0 + kUnroll, wn, sfn);
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
             const int kc = k0 + u;
@@ -234,6 +239,13 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
 #pragma unroll
                 for (int s = 0; s < NT; ++s) mma_fp4(acc[j][s], wv[j][u], b0[s], b1[s], sa, sfb[s]);
             }
+        }
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j) {
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) wv[j][u] = wn[j][u];
+#pragma unroll
+            for (int q = 0; q < kSw; ++q) sfa[j][q] = sfn[j][q];
         }
     }
 }
