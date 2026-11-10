@@ -302,7 +302,8 @@ MegaMoE, so those kernels have no upstream counterpart.
 
 SM120 (8x RTX 6000D, PCIe P2P, no NVLink; CUDA-event timing, so not in the nsys table above), against vLLM's Marlin
 MXFP4 MoE with NCCL all-gather / reduce-scatter on the same layout: the EP kernel's MoE layer is 21-29 % shorter on
-DeepSeek-V4-Flash EP4 (1-64 tokens per rank) and 1.6-2.2x faster on this README's shape at EP8 with cold L2; in Toklin
+DeepSeek-V4-Flash EP4 (1-64 tokens per rank) and 1.6-3.0x faster on this README's shape at EP8 with cold L2 (W4A8 on the new SM120 kernel, which also runs W4A4
+MXFP4 / NVFP4: 44.8 / 60.1 / 78.0 / 128.9 µs at M2 / 4 / 8 / 16, [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md)); in Toklin
 CI AgentX the PD layout with the kernel on its DP4/EP4 decode worker gains 6-8 % throughput and 9-13 % ITL at CC32-80.
 Tables, per-phase stamps and the TP kernel: [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md).
 
@@ -325,6 +326,9 @@ deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused_body.inl
 deep_gemm/include/deep_gemm/impls/sm120_mxfp4_mega_moe.cu
 deep_gemm/mega/sm120.py
 tests/test_mega_moe_sm120.py
+deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu
+deep_gemm/mega/sm120_fp4.py
+tests/test_mega_moe_sm120_fp4.py
 sm120_6000d/vllm/
 tests/test_fable_frontend_correctness.py
 tests/test_four_api_smoke.py
