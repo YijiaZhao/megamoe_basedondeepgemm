@@ -3,9 +3,8 @@
 #       EP vs a quantization-exact reference, every tokens-per-item width (small: H512 / I256 / E128 / top-6;
 #       readme: the README shape H3072 / I1280 / E384 / top-8)
 #   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 1024
-#       README shape and method, global M tokens (TILE=8/16/24/32 forces the tokens per item); `w4a8` is this
-#       kernel with MXFP8 activations; `stamps` instead of `bench` prints the
-#       per-phase kernel stamps
+#       cold-L2 kernel time, README shape, global M tokens (TILE=8/16 forces the tokens per item); `w4a8` is this
+#       kernel with MXFP8 activations; `stamps` instead of `bench` prints the per-phase kernel stamps
 # The reference applies the kernel's quantization to the activations and to the SwiGLU output:
 #   MXFP4: per 32, scale 2^ceil(log2(amax/6)), E2M1 round-to-nearest-even.
 #   W4A8: per 32, scale 2^ceil(log2(amax/448)), E4M3.
@@ -132,7 +131,7 @@ def verify(fmt, shape, rank, world, group):
         x = (torch.randn(t, h, device='cuda', generator=torch.Generator(device='cuda').manual_seed(5 + rank + trial))
              * 0.5).bfloat16()
         ref = reference(x, ids, wts, lambda g: expert_codes(g, h, i, fmt), i, fmt)
-        for tile in (0, 8, 16, 24, 32):  # 0: the automatic choice
+        for tile in (0, 8, 16):  # 0: the automatic choice
             y = torch.zeros(t, h, device='cuda', dtype=torch.bfloat16)
             for _ in range(2):  # the second call checks the per-call state was reset
                 fp4.fp4_mega_moe_sm120(y, x, ids, wts, l1, l2, buf, gs, activation_clamp=LIMIT, tile_tokens=tile)
@@ -154,8 +153,8 @@ STAMPS = [(8, 'route-push'), (1, 'dispatched'), (12, 'flag-sent'), (9, 'route-ok
 def bench(fmt, rank, world, group, ms, stamps=False):
     """README shape and method (docs/SM120_MEGAMOE_RESULTS.md, ep_kernel_bench.py h20shape): global M tokens over the
     ranks (one row per rank up to M = world), balanced routing expert = s * EL + (g + 7 s) % EL with weight 1/top-k.
-    Warm L2: 3 passes of 2 warm-up + 30 streamed graph replays, median of the last 3, median over the passes. Cold L2:
-    256 MB written before each replay, ranks released by a barrier, median of 30 replays, median over 3 passes."""
+    Cold L2: 256 MB written (COLD=read: read) before each graph replay, ranks released by a barrier, median of 30
+    replays, median over 3 passes."""
     h, i, e, topk = SHAPES['readme']
     el = e // world
     gen = torch.Generator(device='cuda').manual_seed(20261023 + rank)
@@ -188,7 +187,7 @@ def bench(fmt, rank, world, group, ms, stamps=False):
         torch.cuda.synchronize()
         assert buf.error() == 0, f'rank {rank}: kernel error word {buf.error()}'
         if stamps:  # per-phase globaltimer stamps (us since this rank's first CTA start, max over CTAs) of the last of
-            # 8 graph replays: cold L2 (256 MB written, ranks released by a barrier), or streamed with WARM=1
+            # 8 graph replays, cold L2 as below
             st = torch.zeros(4096, 16, dtype=torch.int64, device='cuda')
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -196,10 +195,9 @@ def bench(fmt, rank, world, group, ms, stamps=False):
             torch.cuda.synchronize()
             dist.barrier()
             for _ in range(8):
-                if os.environ.get('WARM') != '1':
-                    flush.sum() if os.environ.get('COLD') == 'read' else flush.fill_(1)
-                    torch.cuda.synchronize()
-                    dist.barrier()
+                flush.sum() if os.environ.get('COLD') == 'read' else flush.fill_(1)
+                torch.cuda.synchronize()
+                dist.barrier()
                 graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
@@ -209,28 +207,13 @@ def bench(fmt, rank, world, group, ms, stamps=False):
             line = [f'{name} {((st[:, k][st[:, k] > 0].max() - t0) / 1e3).item():.1f}' for k, name in STAMPS
                     if (st[:, k] > 0).any()]
             if rank == 0:
-                print(f'stamps {fmt} {"warm" if os.environ.get("WARM") == "1" else "cold"} M{m} rank0: ' + ' | '.join(line), flush=True)
+                print(f'stamps {fmt} M{m} rank0: ' + ' | '.join(line), flush=True)
             continue
         dist.barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run_fn(y, x, ids, wts)
         dist.barrier()
-        warm = []
-        for _ in range(3):
-            ev = [torch.cuda.Event(enable_timing=True) for _ in range(33)]
-            torch.cuda.synchronize()
-            dist.barrier()
-            graph.replay()
-            graph.replay()
-            for k in range(32):
-                ev[k].record()
-                if k < 30:
-                    graph.replay()
-            torch.cuda.synchronize()
-            ts = [ev[k].elapsed_time(ev[k + 1]) * 1e3 for k in range(30)]
-            warm.append(statistics.median(ts[-3:]))
-            dist.barrier()
         cold = []
         for _ in range(3):
             ts = []
@@ -249,13 +232,12 @@ def bench(fmt, rank, world, group, ms, stamps=False):
                 ts.append(a.elapsed_time(b) * 1e3)
             cold.append(statistics.median(ts[2:]))
         assert buf.error() == 0
-        us = torch.tensor([statistics.median(warm), statistics.median(cold)], device='cuda')
+        us = torch.tensor([statistics.median(cold)], device='cuda')
         allus = [torch.zeros_like(us) for _ in range(world)]
         dist.all_gather(allus, us)
         if rank == 0:
-            print(f'{fmt} readme EP{world} tile {tile or "auto"} M{m} (T/rank {rows}): gpu0 warm {allus[0][0].item():.1f} '
-                  f'cold {allus[0][1].item():.1f} us | max-rank warm {max(a[0].item() for a in allus):.1f} '
-                  f'cold {max(a[1].item() for a in allus):.1f}', flush=True)
+            print(f'{fmt} readme EP{world} tile {tile or "auto"} M{m} (T/rank {rows}): gpu0 cold '
+                  f'{allus[0].item():.1f} us | max-rank {max(a.item() for a in allus):.1f}', flush=True)
         del graph
         torch.cuda.synchronize()
         dist.barrier()

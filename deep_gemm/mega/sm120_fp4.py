@@ -170,7 +170,7 @@ def fp4_mega_moe_sm120(y: torch.Tensor,
     """EP MegaMoE over the buffer's group. `x` [T, H] bf16 (T <= num_max_tokens_per_rank), `topk_idx` [T, K] global
     expert ids (-1 = skip), `topk_weights` [T, K]; `y` [T, H] bf16 receives the combined output. Weights are this
     rank's experts from `transform_fp4_weights_for_mega_moe_sm120`; 'nvfp4' also takes `nvfp4_global_scales`.
-    `tile_tokens`: tokens per work item (8 / 16 / 24 / 32; each weight fragment feeds that many tokens), 0 = chosen
+    `tile_tokens`: tokens per work item (8 / 16; each weight fragment feeds that many tokens), 0 = chosen
     from the expected tokens per local expert. Every rank of the group must call it."""
     assert x.shape[0] <= sym_buffer.num_max_tokens_per_rank
     assert (global_scales is not None) == (sym_buffer.fmt == 'nvfp4')

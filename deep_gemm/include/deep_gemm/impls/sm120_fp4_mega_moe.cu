@@ -53,12 +53,8 @@ constexpr int kWarps = 8;
 constexpr int kNbPerWarp = 1;
 constexpr int kRowsPerItem = kWarps * kNbPerWarp * 16;  // 128 weight rows per work item
 constexpr int kTile = 8;                                // tokens per MMA (N); an item takes NT of them
-constexpr int kMaxNt = 4;
+constexpr int kMaxNt = 2;
 constexpr size_t kPf0Bytes = size_t(64) << 20;          // t=0 L2 prefetch budget over the locally known experts
-#ifndef SM120_FP4_L2KEEP_MB
-#define SM120_FP4_L2KEEP_MB 110
-#endif
-constexpr size_t kL2Keep = size_t(SM120_FP4_L2KEEP_MB) << 20;  // active weights up to this size stay in L2 between calls (112 MB)
 constexpr int kUnroll = 4;
 constexpr int kMaxWorld = 8;
 constexpr int kMaxEl = 256;
@@ -166,10 +162,9 @@ __device__ __forceinline__ void expand(uint32_t w, uint32_t &lo, uint32_t &hi) {
 }
 
 // warp GEMM over one 128-row item and NT n8 token sub-tiles: acc[j][s] = rows (nb0+j)*16 + {g, g+8}, cols = tokens
-// s*8 + 2c, 2c+1. Each weight fragment is loaded once and feeds NT MMAs. PLAIN: cached weight loads (the weights stay
-// in L2 for the next call); otherwise streaming loads, which read faster once the active weights exceed L2.
+// s*8 + 2c, 2c+1. Each weight fragment is loaded once (streaming load) and feeds NT MMAs.
 // xrow[s]: this lane's token row of sub-tile s (K/kXB bytes, as words), xsrow[s]: its scale words (K/kSfWordK).
-template <int NT, bool PLAIN>
+template <int NT>
 __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const uint4 *W, const uint32_t *WS, int nb0,
                                           int K, const uint32_t *const (&xrow)[NT], const uint32_t *const (&xsrow)[NT],
                                           int lane) {
@@ -187,12 +182,13 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
 #pragma unroll
         for (int s = 0; s < NT; ++s) acc[j][s][0] = acc[j][s][1] = acc[j][s][2] = acc[j][s][3] = 0.f;
     constexpr int kSw = kNv ? kUnroll : kUnroll / 2;  // scale words per unrolled step
+#pragma unroll 2  // two steps of loads in flight; left to the compiler it is not unrolled (≈ 10 µs slower at M2)
     for (int k0 = 0; k0 < kch; k0 += kUnroll) {
         uint4 wv[kNbPerWarp][kUnroll];
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u)
 #pragma unroll
-            for (int j = 0; j < kNbPerWarp; ++j) wv[j][u] = PLAIN ? wp[j][(k0 + u) * 32] : __ldcs(wp[j] + (k0 + u) * 32);
+            for (int j = 0; j < kNbPerWarp; ++j) wv[j][u] = __ldcs(wp[j] + (k0 + u) * 32);
         uint32_t sfa[kNbPerWarp][kSw];
 #pragma unroll
         for (int q = 0; q < kSw; ++q)
@@ -314,8 +310,7 @@ struct Map {  // per-expert token bookkeeping, built identically by every CTA af
     int cnt[kMaxWorld][kMaxEl];
     int ne[kMaxEl];
     int tiles_prefix[kMaxEl + 1];
-    int lag;    // queue: FC2 of tile t follows FC1 of tile t + lag
-    int plain;  // the active experts' weights fit kL2Keep: cached loads
+    int lag;  // queue: FC2 of tile t follows FC1 of tile t + lag
 };
 
 __device__ __forceinline__ void token_src(const Map &m, int el, int j, int W, int &w, int &i) {
@@ -391,10 +386,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
     }
 
     // ---------------- t=0: pull the locally known experts' FC1 weights into L2 (budget kPf0Bytes), on the CTAs that
-    // do not dispatch (unless few are left): the rows and their flags must not wait for it
+    // do not dispatch: the rows and their flags must not wait for it
     const int nfree = int(gridDim.x) - ndisp;
-    const bool pf_all = nfree * 4 < int(gridDim.x);
-    if (kPf0Bytes > 0 && EL <= 64 && (pf_all || int(blockIdx.x) >= ndisp)) {
+    if (kPf0Bytes > 0 && EL <= 64 && int(blockIdx.x) >= ndisp) {
         __shared__ unsigned long long s_known;
         if (threadIdx.x == 0) s_known = 0;
         __syncthreads();
@@ -408,8 +402,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
         if (nk > 0) {  // whole experts in ascending order: the order the FC1 items consume them
             const size_t per = size_t(2 * I) * H / 2;
             const size_t lines = min(kPf0Bytes, per * nk) / 128;
-            const size_t first = size_t(pf_all ? blockIdx.x : blockIdx.x - ndisp) * blockDim.x + threadIdx.x;
-            for (size_t l = first; l < lines; l += size_t(pf_all ? gridDim.x : nfree) * blockDim.x) {
+            const size_t first = size_t(blockIdx.x - ndisp) * blockDim.x + threadIdx.x;
+            for (size_t l = first; l < lines; l += size_t(nfree) * blockDim.x) {
                 const int ki = int(l / (per / 128));
                 unsigned long long rest = known;
                 for (int q = 0; q < ki; ++q) rest &= rest - 1;
@@ -502,13 +496,12 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
     for (int u = threadIdx.x; u < W * EL; u += blockDim.x) m.cnt[u / EL][u % EL] = __ldcv(a.peers.route[a.rank] + u);
     __syncthreads();
     if (warp == 0) {
-        int tiles_sum = 0, tiles_max = 0, nact = 0;
+        int tiles_sum = 0, tiles_max = 0;
         for (int base = 0; base < EL; base += 32) {
             const int el = base + lane;
             int n = 0;
             if (el < EL)
                 for (int w = 0; w < W; ++w) n += m.cnt[w][el];
-            nact += __popc(__ballot_sync(0xffffffffu, n > 0));
             int incl = (n + kT - 1) / kT;
             tiles_max = max(tiles_max, incl);
 #pragma unroll
@@ -527,18 +520,17 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
         if (lane == 0) {  // lag: one wave of CTAs (their static first items are FC1) + an expert's own later tiles
             m.tiles_prefix[0] = 0;
             m.lag = min(tiles_sum, (int(gridDim.x) + 2 * I / kRowsPerItem - 1) / (2 * I / kRowsPerItem) + tiles_max);
-            m.plain = size_t(nact) * (size_t(3 * I) * H / 2 + size_t(3 * I) * H / kSfVec) <= kL2Keep;
         }
     }
     __syncthreads();
     st_[10] = gtime();
     {  // this CTA's first item is static: pull this warp's share of its weights and scales into L2 now. The item is
         // FC1 while the queue head lasts; with few tokens the later CTAs start on FC2 items, whose weights then arrive
-        // while FC1 runs. Skipped when the weights stay in L2 between calls (it would only delay the rows wait)
+        // while FC1 runs. Skipped up to 8 tiles, where it only delays the rows wait
         const int nblk1 = 2 * I / kRowsPerItem, nblk2 = H / kRowsPerItem;
         const int ntiles = m.tiles_prefix[EL];
         const int item = first_item(blockIdx.x, gridDim.x);
-        if (!m.plain && item < ntiles * (nblk1 + nblk2)) {
+        if (ntiles > 8 && item < ntiles * (nblk1 + nblk2)) {
             bool l1;
             int tile_g, rb;
             item_decode(item, ntiles, nblk1, nblk2, m.lag, l1, tile_g, rb);
@@ -575,7 +567,6 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
         const size_t w13_expert = size_t(2 * I / 16) * (H / 64) * 32, ws13_expert = size_t(2 * I / 16) * (H / kSfWordK) * 16;
         const size_t w2_expert = size_t(H / 16) * (I / 64) * 32, ws2_expert = size_t(H / 16) * (I / kSfWordK) * 16;
         const int TOKE = W * TCAP;
-        const bool plain = m.plain;
 
         bool first = true;
         while (true) {
@@ -624,10 +615,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
                     xr[s] = reinterpret_cast<const uint32_t *>(pool_x + row * (H / kXB));
                     xs[s] = pool_xs + row * (H / kSfWordK);
                 }
-                if (plain)
-                    item_gemm<NT, true>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
-                else
-                    item_gemm<NT, false>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
+                item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
                 const float alpha = kNv ? a.gscale[0] * a.gscale[2 + el] : 1.f;
                 // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
                 constexpr int kItemInter = kRowsPerItem / 2;
@@ -670,10 +658,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
                     xr[s] = reinterpret_cast<const uint32_t *>(a.inter + r * (I / kXB));
                     xs[s] = a.inter_s + r * (I / kSfWordK);
                 }
-                if (plain)
-                    item_gemm<NT, true>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
-                else
-                    item_gemm<NT, false>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
+                item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
                 const float alpha = kNv ? a.gscale[1] * a.gscale[2 + EL + el] : 1.f;
 #pragma unroll
                 for (int jb = 0; jb < kNbPerWarp; ++jb) {
@@ -827,7 +812,7 @@ torch::Tensor init(int rank, int world, int EL, int TCAP, int H, int I, int TOPK
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
     const int sms = prop.multiProcessorCount;
-    g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms), g.grid[3] = grid_for<3>(sms), g.grid[4] = grid_for<4>(sms);
+    g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms);
     cudaIpcMemHandle_t h;
     CHECK_CUDA(cudaIpcGetMemHandle(&h, g.local_alloc));
     auto t = torch::empty({int64_t(sizeof(h))}, torch::dtype(torch::kUInt8));
@@ -899,13 +884,11 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
         // at 8, and at 16 around 64 tokens per rank
         nt = !kA8 || (per_expert > 8.f && per_expert <= 16.f) ? 2 : 1;
     }
-    TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8, 16, 24 or 32");
+    TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8 or 16");
     auto stream = c10::cuda::getCurrentCUDAStream();
     switch (nt) {
         case 1: sm120_fp4_mega_moe_kernel<1><<<g.grid[1], kWarps * 32, 0, stream>>>(a); break;
-        case 2: sm120_fp4_mega_moe_kernel<2><<<g.grid[2], kWarps * 32, 0, stream>>>(a); break;
-        case 3: sm120_fp4_mega_moe_kernel<3><<<g.grid[3], kWarps * 32, 0, stream>>>(a); break;
-        default: sm120_fp4_mega_moe_kernel<4><<<g.grid[4], kWarps * 32, 0, stream>>>(a); break;
+        default: sm120_fp4_mega_moe_kernel<2><<<g.grid[2], kWarps * 32, 0, stream>>>(a); break;
     }
     CHECK_CUDA(cudaGetLastError());
 }
