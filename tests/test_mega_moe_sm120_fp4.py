@@ -3,7 +3,7 @@
 #       EP vs a quantization-exact reference, every tokens-per-item width (small: H512 / I256 / E128 / top-6;
 #       readme: the README shape H3072 / I1280 / E384 / top-8; wide: H5120 / I256 / E128 / top-6, the token goes
 #       out in several dispatch chunks)
-#   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 512
+#   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 512 1024
 #       cold-L2 kernel time, README shape, global M tokens (TILE=8/16 forces the tokens per item); `w4a8` is this
 #       kernel with MXFP8 activations; `stamps` instead of `bench` prints the per-phase kernel stamps
 #   Either mode takes a transport among its arguments (p2p, the default / auto / nic: every other rank over the NIC
@@ -126,9 +126,9 @@ def verify(fmt, shape, rank, world, group, transport):
     h, i, e, topk = SHAPES[shape]
     el = e // world
     l1, l2, gs = kernel_inputs(fmt, [expert_codes(rank * el + j, h, i, fmt) for j in range(el)])
-    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, 64, topk, h, i, transport)
+    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, 128, topk, h, i, transport)
     worst = 0.0
-    for trial, t in enumerate([1, 3, 8, 13, 64] if shape == 'small' else [1, 3, 13, 40]):
+    for trial, t in enumerate([1, 3, 8, 13, 64, 128] if shape == 'small' else [1, 3, 13, 40, 128]):
         ids, wts = routing(t, e, topk, 77 + 10 * trial + rank)
         if trial % 2 == 1:  # padding token: every k is -1
             ids[-1] = -1
@@ -260,7 +260,7 @@ def main():
     if mode == 'verify':
         verify(fmt, args[0] if args else 'small', rank, world, dist.group.WORLD, transport)
     else:
-        bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512], transport,
+        bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512, 1024], transport,
               mode == 'stamps')
     dist.barrier()
     dist.destroy_process_group()
