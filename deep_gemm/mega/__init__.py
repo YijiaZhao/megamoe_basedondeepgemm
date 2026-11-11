@@ -586,6 +586,8 @@ def qoq_mega_moe_split(*args, **kwargs):
     return mxfp4_mega_moe(*args, **kwargs)
 
 from .fused import FusedSymmBuffer, get_fused_symm_buffer_for_mega_moe, transform_mxfp4_weights_for_mega_moe_fused, transform_qoq_weights_for_mega_moe_fused, mxfp4_mega_moe_fused, qoq_mega_moe_fused
+from .sm120 import (Sm120MegaMoeBuffer, get_symm_buffer_for_mega_moe_sm120, transform_mxfp4_weights_for_mega_moe_sm120,
+                    mxfp4_mega_moe_sm120, init_mxfp4_moe_tp_sm120, mxfp4_moe_tp_sm120, mxfp4_moe_tp_sm120_error)
 
 
 _FRONTEND_STAMPS_BYTES = 256 * 8 * 8

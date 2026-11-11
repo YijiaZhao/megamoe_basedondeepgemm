@@ -2,8 +2,8 @@
 
 Expert-parallel MoE layer kernels for decode-size batches, built on DeepGEMM: four explicit
 Hopper/H20 APIs plus one shared Fable dynamic-M frontend, the Blackwell/B200 kernels under
-`sm100_b200/`, and the SM120 (RTX PRO 6000 / 6000D) EP decode kernel (`fp4_mega_moe_sm120`). Split and Fused retain
-independent workspaces, layouts, schedulers, and ABI contracts.
+`sm100_b200/`, the SM120 (RTX PRO 6000 / 6000D) EP decode kernel (`fp4_mega_moe_sm120`) and the SM120 TP kernel
+(`mxfp4_moe_tp_sm120`). Split and Fused retain independent workspaces, layouts, schedulers, and ABI contracts.
 
 Best measured MegaMoE kernel time (single kernel, forced-balanced, E384 / H3072 / I1280 / top-8 / EP8,
 GPU 0, median of the last 3 of 30 streamed replays, µs at global M = 2 / 4 / 8 / 16; full tables in
@@ -321,6 +321,9 @@ deep_gemm/include/deep_gemm/impls/fable_cc_select.cuh
 deep_gemm/include/deep_gemm/impls/sm90_mxfp4_mega_moe.cuh
 deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh
 deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused_body.inl
+deep_gemm/include/deep_gemm/impls/sm120_mxfp4_mega_moe.cu
+deep_gemm/mega/sm120.py
+tests/test_mega_moe_sm120.py
 deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu
 deep_gemm/mega/sm120_fp4.py
 tests/test_mega_moe_sm120_fp4.py
