@@ -27,7 +27,7 @@ _KEY = {}
 
 
 def _ext(fmt: str):
-    # `DG_SM120_FP4_MEGA_MOE_SO_<FMT>`: a prebuilt extension
+    # environment variables: sm120_6000d/ENV.md
     if fmt not in _EXT:
         name = f'sm120_fp4_mega_moe_{fmt}'
         so = os.environ.get(f'DG_SM120_FP4_MEGA_MOE_SO_{fmt.upper()}')
@@ -44,8 +44,7 @@ def _ext(fmt: str):
             _EXT[fmt] = load(name=name, sources=[_SRC], build_directory=build_dir,
                              extra_cuda_cflags=['-gencode=arch=compute_120a,code=sm_120a', '-O3', '-std=c++20',
                                                 '--use_fast_math', f'-DSM120_FP4_NV={int(fmt == "nvfp4")}',
-                                                f'-DSM120_FP4_A8={int(fmt == "w4a8")}']
-                                               + os.environ.get('DG_SM120_FP4_CFLAGS', '').split())
+                                                f'-DSM120_FP4_A8={int(fmt == "w4a8")}'])
     return _EXT[fmt]
 
 
