@@ -76,13 +76,13 @@ H20 / B200 rows for the same shape are in the README table.
 | `mxfp4_mega_moe_sm120`, warm L2 | **45.1** | **53.2** | **69.6** | **106.5** |
 | Marlin + AG/RS, warm L2 | 112.6 | 110.6 | 112.6 | 110.6 |
 | `mxfp4_mega_moe_sm120`, cold L2 | 60.9 | 75.1 | 92.5 | 128.4 |
-| `fp4_mega_moe_sm120` W4A8, cold L2 | **44.8** | **60.1** | **78.0** | **128.9** |
-| `fp4_mega_moe_sm120` W4A4 MXFP4, cold L2 | 45.3 | 61.2 | 78.2 | 129.5 |
-| `fp4_mega_moe_sm120` W4A4 NVFP4, cold L2 | 47.7 | 63.6 | 82.7 | 136.7 |
+| `fp4_mega_moe_sm120` W4A8, cold L2 | **44.0** | **58.0** | **78.6** | **116.0** |
+| `fp4_mega_moe_sm120` W4A4 MXFP4, cold L2 | 45.8 | 59.8 | 79.7 | 117.9 |
+| `fp4_mega_moe_sm120` W4A4 NVFP4, cold L2 | 49.2 | 62.8 | 82.5 | 123.1 |
 | Marlin + AG/RS, cold L2 | 134.3 | 141.0 | 162.8 | 203.6 |
 
 Cold L2 is what a decode step sees (43 layers of weights per step, far beyond the L2): 2.2x / 1.9x / 1.8x / 1.6x
-for `mxfp4_mega_moe_sm120`, 3.0x / 2.3x / 2.1x / 1.6x for `fp4_mega_moe_sm120` W4A8 (same formats; all M
+for `mxfp4_mega_moe_sm120`, 3.1x / 2.4x / 2.1x / 1.8x for `fp4_mega_moe_sm120` W4A8 (same formats; all M
 and what bounds it: [sm120_6000d/W4A4.md](../sm120_6000d/W4A4.md)). The README's H20 rows are
 measured with the same 256 MiB write before each replay: 38.8 / 47.4 / 56.7 / 76.2 (MXFP4 fused).
 Warm L2 favours Marlin at M16: each rank's 16 active experts (~94 MB) fit the 112 MB L2, so its GEMMs read from L2
