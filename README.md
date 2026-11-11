@@ -301,7 +301,8 @@ B200 rows were measured in the same Slurm job and container; upstream DeepGEMM h
 MegaMoE, so those kernels have no upstream counterpart.
 
 SM120 (8x RTX 6000D, PCIe P2P, no NVLink; CUDA-event timing, so not in the nsys table above): `fp4_mega_moe_sm120`,
-one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4. This README's shape, EP8, cold L2
+one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4, over PCIe P2P or, for peers on
+another host, the NIC (NCCL GIN), up to 16 ranks. This README's shape, EP8, cold L2
 (256 MB written before each replay), W4A8: 43.6 / 57.7 / 78.6 / 116.3 µs at M2 / 4 / 8 / 16; all formats, method and
 correctness: [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md); environment variables: [sm120_6000d/ENV.md](sm120_6000d/ENV.md).
 

@@ -17,6 +17,13 @@
  * W13 block b = gate rows 8b..8b+7 then up rows 8b..8b+7 (SwiGLU pairs land in one thread: acc rows g and g+8).
  * Scales [blocks][K/kSfWordK][16 rows] u32, byte s = scale of the s-th K group of the word (4 groups per word).
  * Every spin wait times out after kSpinNs and reports through the error word instead of hanging the GPU.
+ *
+ * NIC transport (SM120_FP4_GIN=1, NCCL Device API): the buffer is one NCCL symmetric window (the same layout on every
+ * rank) and the ranks in Gin::mask (e.g. on another host) are reached with GIN puts through the NIC instead of P2P
+ * stores. A payload is staged in this rank's window first, then put to the peer's receive region at the offset a P2P
+ * store would use. Each put adds 1 to a signal of the receiver, one per source and kind (routing, rows, partials);
+ * the receiver knows how many puts to expect (1 routing put, 3 per row: data, scales, metadata; 1 per token and FC2
+ * item of partials) and waits for the cumulative signal instead of a flag.
  */
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -28,6 +35,17 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+
+#ifndef SM120_FP4_GIN
+#define SM120_FP4_GIN 0
+#endif
+// GIN code is device-pass only: NCCL's device headers do not compile in nvcc's host pass
+#if SM120_FP4_GIN && defined(__CUDA_ARCH__)
+#define SM120_FP4_GIN_DEVICE 1
+#include <nccl_device.h>
+#else
+#define SM120_FP4_GIN_DEVICE 0
+#endif
 
 #define CHECK_CUDA(x)                                                                      \
     do {                                                                                   \
@@ -56,14 +74,18 @@ constexpr int kTile = 8;                                // tokens per MMA (N); a
 constexpr int kMaxNt = 2;
 constexpr size_t kPf0Bytes = size_t(64) << 20;          // t=0 L2 prefetch budget over the locally known experts
 constexpr int kUnroll = 4;
-constexpr int kMaxWorld = 8;
+constexpr int kMaxWorld = 16;
 constexpr int kMaxEl = 256;
 constexpr uint64_t kSpinNs = 30000000000ull;
 
 constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRouteWait = 4;
 constexpr int kCtrDispatch = 0, kCtrQueue = 1, kCtrL2Done = 2, kCtrErr = 3, kCtrExit = 4, kCtrEpoch = 5;
 constexpr int kCtrFlag = 8, kCtrL1 = 16;  // kCtrFlag: local copies (epoch) of the route / rows / combine flags
-constexpr int kCtrInts = kCtrL1 + kMaxEl;
+// GIN: cumulative signal totals received per kind and source (u64, kept across calls)
+constexpr int kCtrCum = kCtrL1 + kMaxEl;
+constexpr int kCtrInts = kCtrCum + 2 * 3 * kMaxWorld;
+static_assert(kCtrCum % 2 == 0, "the cumulative GIN totals must be 8-byte aligned");
+constexpr int kSigRoute = 0, kSigRows = kMaxWorld, kSigComb = 2 * kMaxWorld;  // GIN signal ids, + source rank
 
 struct Peers {
     uint8_t *pool_x[kMaxWorld];     // [EL][W][TCAP][H/kXB] E2M1 / E4M3  (dest-owned)
@@ -74,6 +96,21 @@ struct Peers {
     int *comb_flag[kMaxWorld];      // [W] epoch
     int *route[kMaxWorld];          // [W][EL]: tokens each source rank sends to each expert (dest-owned)
     int *route_flag[kMaxWorld];     // [W] epoch
+};
+
+// NIC transport: window offsets of the receive regions (the P2P layout) and of this rank's staging regions, and the
+// staging pointers. mask 0 (always without SM120_FP4_GIN): every peer over P2P.
+struct Gin {
+    const void *comm;  // ncclDevComm const * (device memory)
+    void *win;         // ncclWindow_t of the whole buffer
+    uint32_t mask;     // bit w: rank w is reached with GIN puts
+    int nctx;          // GIN contexts: CTA b posts on context b % nctx; a signal is the sum over them
+    size_t off_pool_x, off_pool_xs, off_meta, off_comb, off_route, st_route, st_x, st_xs, st_meta, st_comb;
+    int *s_route;           // [W][EL] this rank's token counts for each GIN peer's experts
+    uint8_t *s_x;           // [TCAP][H/kXB] this rank's quantized tokens
+    uint8_t *s_xs;          // [TCAP][H/kSfVec] their scale bytes
+    int *s_meta;            // [TCAP][TOPK] t*8 + k of each copy
+    __nv_bfloat16 *s_comb;  // [W][TCAP][TOPK][H] partials for each GIN source
 };
 
 struct Args {
@@ -91,6 +128,7 @@ struct Args {
     int *ctr;                 // kCtrInts
     unsigned long long *stamps;  // optional [grid][16] globaltimer stamps (debug)
     Peers peers;
+    Gin gin;
     int T, H, I, EL, W, TOPK, TCAP, rank;
     float swiglu_limit;
 };
@@ -119,12 +157,51 @@ __device__ __forceinline__ bool wait_ge(const int *p, int v, bool sys) {
     return true;
 }
 
-// Wait for every peer's flag (written over PCIe). One CTA polls them, a thread per peer, and republishes on a local
-// word that the other CTAs wait on: with every CTA polling, the loads delay the flags' arrival by microseconds.
-__device__ __forceinline__ bool wait_peers(const int *flags, int W, int epoch, int *local, bool poller) {
+__device__ __forceinline__ unsigned long long *gin_cum(int *ctr) {  // [3 kinds][kMaxWorld sources]
+    return reinterpret_cast<unsigned long long *>(ctr + kCtrCum);
+}
+#if SM120_FP4_GIN_DEVICE
+__device__ __forceinline__ bool is_gin(const Args &a, int w) { return (a.gin.mask >> w) & 1u; }
+// a CTA posts every put on one context; the CTAs spread over the contexts' queue pairs
+__device__ __forceinline__ void gin_put(const Args &a, int peer, size_t dst_off, size_t src_off, size_t bytes, int sig) {
+    const ncclDevComm &c = *static_cast<const ncclDevComm *>(a.gin.comm);
+    const ncclWindow_t win = static_cast<ncclWindow_t>(a.gin.win);
+    ncclGin(c, int(blockIdx.x) % a.gin.nctx)
+        .put(ncclTeamWorld(c), peer, win, dst_off, win, src_off, bytes, ncclGin_WeakSignalAdd{ncclGinSignal_t(sig), 1});
+}
+// thread spins until GIN signal sig, summed over the contexts, reaches target (64-bit rolling compare)
+__device__ __forceinline__ bool gin_wait(const Args &a, int sig, unsigned long long target) {
+    const ncclDevComm &c = *static_cast<const ncclDevComm *>(a.gin.comm);
+    const uint64_t t0 = gtime();
+    while (true) {
+        unsigned long long v = 0;
+        for (int x = 0; x < a.gin.nctx; ++x) v += ncclGin(c, x).readSignal(static_cast<ncclGinSignal_t>(sig));
+        if (static_cast<long long>(v - target) >= 0) return true;
+        if (gtime() - t0 > kSpinNs) return false;
+    }
+}
+#else
+__device__ __forceinline__ constexpr bool is_gin(const Args &, int) { return false; }
+#endif
+
+// Wait for every peer's flag (written over PCIe), or for a GIN peer's signal to reach target(w). One CTA polls them,
+// a thread per peer, and republishes on a local word that the other CTAs wait on: with every CTA polling, the loads
+// delay the flags' arrival by microseconds.
+template <class Target>
+__device__ __forceinline__ bool wait_peers(const Args &a, const int *flags, int W, int epoch, int *local, bool poller,
+                                           int sig, Target target) {
     if (!poller) return threadIdx.x != 0 || wait_ge(local, epoch, false);
     if (threadIdx.x >= 32) return true;
-    const bool ok = int(threadIdx.x) >= W || wait_ge(flags + threadIdx.x, epoch, true);
+    const int w = threadIdx.x;
+    bool ok = true;
+    if (w < W) {
+#if SM120_FP4_GIN_DEVICE
+        if (is_gin(a, w))
+            ok = gin_wait(a, sig + w, target(w));
+        else
+#endif
+            ok = wait_ge(flags + w, epoch, true);
+    }
     if (__all_sync(0xffffffffu, ok) && threadIdx.x == 0) atomicExch(local, epoch);
     return ok;
 }
@@ -400,11 +477,22 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
             if (e >= 0) atomicAdd(&m.cnt[e / EL][e % EL], 1);
         }
         __syncthreads();
-        for (int u = threadIdx.x; u < W * EL; u += blockDim.x)
-            a.peers.route[u / EL][a.rank * EL + u % EL] = m.cnt[u / EL][u % EL];
+        for (int u = threadIdx.x; u < W * EL; u += blockDim.x) {
+            const int d = u / EL;
+            *(is_gin(a, d) ? a.gin.s_route + u : a.peers.route[d] + a.rank * EL + u % EL) = m.cnt[d][u % EL];
+        }
         __threadfence_system();
         __syncthreads();
-        if (threadIdx.x < W) st_release_sys(a.peers.route_flag[threadIdx.x] + a.rank, epoch);  // a thread per peer
+        if (threadIdx.x < W) {  // a thread per peer
+            const int d = threadIdx.x;
+#if SM120_FP4_GIN_DEVICE
+            if (is_gin(a, d))
+                gin_put(a, d, a.gin.off_route + size_t(a.rank) * EL * 4, a.gin.st_route + size_t(d) * EL * 4, EL * 4,
+                        kSigRoute + a.rank);
+            else
+#endif
+                st_release_sys(a.peers.route_flag[d] + a.rank, epoch);
+        }
         st_[8] = gtime();
     }
 
@@ -459,7 +547,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                         const int row = (el * W + a.rank) * TCAP + slot;
                         s_rowk[warp] = row;
                         s_dstk[warp] = dst;
-                        a.peers.pool_meta[dst][row] = t * 8 + warp;
+                        *(is_gin(a, dst) ? a.gin.s_meta + t * TOPK + warp : a.peers.pool_meta[dst] + row) = t * 8 + warp;
                     }
                 }
             }
@@ -486,20 +574,44 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                 __syncthreads();
                 const int nq = ng * kSfVec / kXB / 16, per = nq + ng / 16;  // uint4 per copy: data + scales
                 const int oq = g0 * kSfVec / kXB / 16, os = g0 / 16;      // the chunk's uint4 offsets in the row
-                for (int u = threadIdx.x; u < TOPK * per; u += blockDim.x) {
+                bool any_gin = false;  // copy TOPK: the token's GIN staging row, put from there to each GIN copy
+                for (int k = 0; k < TOPK; ++k) any_gin |= s_rowk[k] >= 0 && is_gin(a, s_dstk[k]);
+                for (int u = threadIdx.x; u < (TOPK + 1) * per; u += blockDim.x) {
                     const int k = u / per, q = u % per;
-                    if (s_rowk[k] < 0) continue;
-                    const size_t row = size_t(s_rowk[k]);
-                    const int dst = s_dstk[k];
+                    uint8_t *dx, *ds;
+                    if (k == TOPK) {
+                        if (!any_gin) continue;
+                        dx = a.gin.s_x + size_t(t) * (H / kXB), ds = a.gin.s_xs + size_t(t) * (H / kSfVec);
+                    } else {
+                        if (s_rowk[k] < 0 || is_gin(a, s_dstk[k])) continue;
+                        const size_t row = size_t(s_rowk[k]);
+                        dx = a.peers.pool_x[s_dstk[k]] + row * (H / kXB);
+                        ds = reinterpret_cast<uint8_t *>(a.peers.pool_xs[s_dstk[k]] + row * (H / kSfWordK));
+                    }
                     if (q < nq)
-                        reinterpret_cast<uint4 *>(a.peers.pool_x[dst] + row * (H / kXB))[oq + q] =
-                            reinterpret_cast<const uint4 *>(s_q)[q];
+                        reinterpret_cast<uint4 *>(dx)[oq + q] = reinterpret_cast<const uint4 *>(s_q)[q];
                     else
-                        reinterpret_cast<uint4 *>(a.peers.pool_xs[dst] + row * (H / kSfWordK))[os + q - nq] =
-                            reinterpret_cast<const uint4 *>(s_sc)[q - nq];
+                        reinterpret_cast<uint4 *>(ds)[os + q - nq] = reinterpret_cast<const uint4 *>(s_sc)[q - nq];
                 }
                 __syncthreads();
             }
+#if SM120_FP4_GIN_DEVICE
+            if (a.gin.mask) {  // each GIN copy: data, scales and metadata from the staging rows, 3 puts
+                __threadfence_system();
+                __syncthreads();
+                if (lane == 0 && warp < TOPK && s_rowk[warp] >= 0 && is_gin(a, s_dstk[warp])) {
+                    const int d = s_dstk[warp];
+                    const size_t row = size_t(s_rowk[warp]);
+                    gin_put(a, d, a.gin.off_pool_x + row * (H / kXB), a.gin.st_x + size_t(t) * (H / kXB), H / kXB,
+                            kSigRows + a.rank);
+                    gin_put(a, d, a.gin.off_pool_xs + row * (H / kSfVec), a.gin.st_xs + size_t(t) * (H / kSfVec),
+                            H / kSfVec, kSigRows + a.rank);
+                    gin_put(a, d, a.gin.off_meta + row * 4, a.gin.st_meta + (size_t(t) * TOPK + warp) * 4, 4,
+                            kSigRows + a.rank);
+                }
+                __syncthreads();
+            }
+#endif
         }
     }
     __threadfence_system();
@@ -507,7 +619,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     st_[1] = gtime();
     if (threadIdx.x == 0) s_item = (atomicAdd(ctr + kCtrDispatch, 1) == int(gridDim.x) - 1);
     __syncthreads();
-    if (s_item && threadIdx.x < W) {  // last CTA out of the dispatch: every CTA has fenced its rows -> flag
+    if (s_item && threadIdx.x < W && !is_gin(a, threadIdx.x)) {  // last CTA out of the dispatch: rows fenced -> flag
         st_release_sys(a.peers.recv_flag[threadIdx.x] + a.rank, epoch);
         st_[12] = gtime();
     }
@@ -515,7 +627,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
 
     // ---------------- per-expert map from the exchanged token counts (same slot order as the dispatch)
     const bool poller = blockIdx.x == gridDim.x - 1;
-    if (!wait_peers(a.peers.route_flag[a.rank], W, epoch, ctr + kCtrFlag, poller)) {
+    if (!wait_peers(a, a.peers.route_flag[a.rank], W, epoch, ctr + kCtrFlag, poller, kSigRoute,
+                    [&](int w) { return gin_cum(ctr)[w] + 1; })) {
         atomicExch(ctr + kCtrErr, kErrRouteWait);
         s_ok = 0;
     }
@@ -578,7 +691,11 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     st_[11] = gtime();
 
     // ---------------- wait for every source rank's rows
-    if (!wait_peers(a.peers.recv_flag[a.rank], W, epoch, ctr + kCtrFlag + 1, poller)) {
+    if (!wait_peers(a, a.peers.recv_flag[a.rank], W, epoch, ctr + kCtrFlag + 1, poller, kSigRows, [&](int w) {
+            int n = 0;  // rows from w
+            for (int el = 0; el < EL; ++el) n += m.cnt[w][el];
+            return gin_cum(ctr)[kMaxWorld + w] + 3ull * n;
+        })) {
         atomicExch(ctr + kCtrErr, kErrDispatchWait);
         s_ok = 0;
     }
@@ -716,14 +833,27 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                             __floats2bfloat162_rn(s_tile[tk][q * 8 + 2 * p], s_tile[tk][q * 8 + 2 * p + 1]);
                         pk[p] = *reinterpret_cast<const uint32_t *>(&b2);
                     }
-                    __nv_bfloat16 *dst = a.peers.comb[w] + (size_t(st) * TOPK + sk) * H + rb * kRowsPerItem + q * 8;
+                    __nv_bfloat16 *dst = (is_gin(a, w) ? a.gin.s_comb + size_t(w) * TCAP * TOPK * H : a.peers.comb[w]) +
+                                         (size_t(st) * TOPK + sk) * H + rb * kRowsPerItem + q * 8;
                     *reinterpret_cast<uint4 *>(dst) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
                 }
                 __threadfence_system();
                 __syncthreads();
+#if SM120_FP4_GIN_DEVICE
+                if (a.gin.mask)  // a GIN source's tokens: their kRowsPerItem partial columns, a put per token
+                    for (int tk = threadIdx.x; tk < ntok; tk += blockDim.x) {
+                        int w, i;
+                        token_src(m, el, tile * kT + tk, W, w, i);
+                        if (!is_gin(a, w)) continue;
+                        const int meta = pool_meta[(size_t(el) * W + w) * TCAP + i];
+                        const size_t off = ((size_t(meta / 8) * TOPK + meta % 8) * H + rb * kRowsPerItem) * 2;
+                        gin_put(a, w, a.gin.off_comb + off, a.gin.st_comb + size_t(w) * TCAP * TOPK * H * 2 + off,
+                                kRowsPerItem * 2, kSigComb + a.rank);
+                    }
+#endif
                 if (threadIdx.x == 0) s_item = atomicAdd(ctr + kCtrL2Done, 1) == n2 - 1;
                 __syncthreads();
-                if (s_item && threadIdx.x < W) {  // this rank's last FC2 item: tell every source rank
+                if (s_item && threadIdx.x < W && !is_gin(a, threadIdx.x)) {  // last FC2 item: tell every source rank
                     st_release_sys(a.peers.comb_flag[threadIdx.x] + a.rank, epoch);
                     st_[15] = gtime();
                 }
@@ -731,12 +861,16 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
             __syncthreads();
         }
         st_[3] = gtime();
-        if (n2 == 0 && blockIdx.x == 0 && threadIdx.x < W)  // no local work: still release every source
+        if (n2 == 0 && blockIdx.x == 0 && threadIdx.x < W && !is_gin(a, threadIdx.x))  // no work: still release
             st_release_sys(a.peers.comb_flag[threadIdx.x] + a.rank, epoch);
     }
 
     // ---------------- combine: wait for every expert rank, out[t] = sum_k w[t][k] * partial[t][k]
-    if (!wait_peers(a.peers.comb_flag[a.rank], W, epoch, ctr + kCtrFlag + 2, poller)) {
+    if (!wait_peers(a, a.peers.comb_flag[a.rank], W, epoch, ctr + kCtrFlag + 2, poller, kSigComb, [&](int w) {
+            int n = 0;  // this rank's copies at w, H / kRowsPerItem partial puts each
+            for (int u = 0; u < a.T * TOPK; ++u) n += a.topk_ids[u] >= 0 && a.topk_ids[u] / EL == w;
+            return gin_cum(ctr)[2 * kMaxWorld + w] + (unsigned long long)n * (H / kRowsPerItem);
+        })) {
         atomicExch(ctr + kCtrErr, kErrCombineWait);
         s_ok = 0;
     }
@@ -780,6 +914,17 @@ exit_kernel:
         const int done = atomicAdd(ctr + kCtrExit, 1);
         if (done == int(gridDim.x) - 1) {  // last CTA out: advance the epoch, reset the per-call counters
             ctr[kCtrEpoch] = epoch;
+#if SM120_FP4_GIN_DEVICE
+            for (int w = 0; w < W; ++w)  // the GIN signal totals of this call (see the waits)
+                if (is_gin(a, w)) {
+                    int rows = 0, copies = 0;
+                    for (int el = 0; el < EL; ++el) rows += m.cnt[w][el];
+                    for (int u = 0; u < a.T * TOPK; ++u) copies += a.topk_ids[u] >= 0 && a.topk_ids[u] / EL == w;
+                    gin_cum(ctr)[w] += 1;
+                    gin_cum(ctr)[kMaxWorld + w] += 3ull * rows;
+                    gin_cum(ctr)[2 * kMaxWorld + w] += (unsigned long long)copies * (H / kRowsPerItem);
+                }
+#endif
             ctr[kCtrDispatch] = 0;
             ctr[kCtrQueue] = 0;
             ctr[kCtrL2Done] = 0;
@@ -793,9 +938,14 @@ exit_kernel:
 // ------------------------------------------------------------------------------------------------ host
 struct State {
     int rank = 0, world = 0, EL = 0, TCAP = 0, H = 0, I = 0, TOPK = 0;
-    void *local_alloc = nullptr;  // one cudaMalloc holding every peer-visible buffer
-    size_t off_pool_x, off_pool_xs, off_meta, off_rflag, off_comb, off_cflag, off_route, off_rtflag, total;
-    void *peer_base[kMaxWorld] = {};
+    void *local_alloc = nullptr;  // every peer-visible buffer: one cudaMalloc (P2P) or the NCCL window
+    size_t off_pool_x, off_pool_xs, off_meta, off_rflag, off_comb, off_cflag, off_route, off_rtflag;
+    size_t st_route, st_x, st_xs, st_meta, st_comb, total;  // GIN staging (window only)
+    void *peer_base[kMaxWorld] = {};  // nullptr: a GIN peer
+    uint32_t gin_mask = 0;
+    const void *gin_comm = nullptr;
+    void *gin_win = nullptr;
+    int gin_nctx = 0;
     uint8_t *inter = nullptr;
     uint32_t *inter_s = nullptr;
     int *ctr = nullptr;
@@ -812,8 +962,8 @@ static int grid_for(int sms) {
 
 static size_t align_up(size_t v) { return (v + 255) & ~size_t(255); }
 
-// returns this rank's cudaIpcMemHandle bytes
-torch::Tensor init(int rank, int world, int EL, int TCAP, int H, int I, int TOPK) {
+// the buffer's layout (the same on every rank); with `window`, the GIN staging regions follow
+static void layout(int rank, int world, int EL, int TCAP, int H, int I, int TOPK, bool window) {
     TORCH_CHECK(world <= kMaxWorld && EL <= kMaxEl && TOPK <= 8, "world / experts / top-k out of range");
     TORCH_CHECK(H % kRowsPerItem == 0 && I % kRowsPerItem == 0 && H % (16 * kSfVec) == 0,
                 "unsupported hidden / intermediate size");
@@ -828,11 +978,21 @@ torch::Tensor init(int rank, int world, int EL, int TCAP, int H, int I, int TOPK
     g.off_cflag = o; o = align_up(o + size_t(world) * 4);
     g.off_route = o; o = align_up(o + size_t(world) * EL * 4);
     g.off_rtflag = o; o = align_up(o + size_t(world) * 4);
+    if (window) {
+        g.st_route = o; o = align_up(o + size_t(world) * EL * 4);
+        g.st_x = o; o = align_up(o + size_t(TCAP) * H / kXB);
+        g.st_xs = o; o = align_up(o + size_t(TCAP) * H / kSfVec);
+        g.st_meta = o; o = align_up(o + size_t(TCAP) * TOPK * 4);
+        g.st_comb = o; o = align_up(o + size_t(world) * TCAP * TOPK * H * 2);
+    }
     g.total = o;
-    CHECK_CUDA(cudaMalloc(&g.local_alloc, g.total));
-    CHECK_CUDA(cudaMemset(g.local_alloc, 0, g.total));
-    CHECK_CUDA(cudaMalloc(&g.inter, rows * I / kXB));
-    CHECK_CUDA(cudaMalloc(&g.inter_s, rows * (I / kSfWordK) * 4));
+}
+
+// the rank-local buffers and the grid sizes
+static void setup_local() {
+    const size_t rows = size_t(g.EL) * g.world * g.TCAP;
+    CHECK_CUDA(cudaMalloc(&g.inter, rows * g.I / kXB));
+    CHECK_CUDA(cudaMalloc(&g.inter_s, rows * (g.I / kSfWordK) * 4));
     CHECK_CUDA(cudaMalloc(&g.ctr, kCtrInts * 4));
     CHECK_CUDA(cudaMemset(g.ctr, 0, kCtrInts * 4));
     int dev;
@@ -841,6 +1001,14 @@ torch::Tensor init(int rank, int world, int EL, int TCAP, int H, int I, int TOPK
     CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
     const int sms = prop.multiProcessorCount;
     g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms);
+}
+
+// P2P transport: one cudaMalloc, shared over cudaIpc; returns this rank's handle bytes (open_peers takes everyone's)
+torch::Tensor init(int rank, int world, int EL, int TCAP, int H, int I, int TOPK) {
+    layout(rank, world, EL, TCAP, H, I, TOPK, false);
+    CHECK_CUDA(cudaMalloc(&g.local_alloc, g.total));
+    CHECK_CUDA(cudaMemset(g.local_alloc, 0, g.total));
+    setup_local();
     cudaIpcMemHandle_t h;
     CHECK_CUDA(cudaIpcGetMemHandle(&h, g.local_alloc));
     auto t = torch::empty({int64_t(sizeof(h))}, torch::dtype(torch::kUInt8));
@@ -858,6 +1026,30 @@ void open_peers(std::vector<torch::Tensor> handles) {
         std::memcpy(&h, handles[w].data_ptr(), sizeof(h));
         CHECK_CUDA(cudaIpcOpenMemHandle(&g.peer_base[w], h, cudaIpcMemLazyEnablePeerAccess));
     }
+}
+
+// window transport: bytes of the NCCL window to allocate
+int64_t window_bytes(int rank, int world, int EL, int TCAP, int H, int I, int TOPK) {
+    layout(rank, world, EL, TCAP, H, I, TOPK, true);
+    return int64_t(g.total);
+}
+
+// window transport: `base` this rank's NCCL window (zeroed), `peers` every rank's load/store pointer to its window
+// (0: reached over GIN, bit set in `mask`), `comm` the device ncclDevComm *, `win` the ncclWindow_t
+void init_window(int rank, int world, int EL, int TCAP, int H, int I, int TOPK, int64_t base,
+                 std::vector<int64_t> peers, int64_t mask, int64_t comm, int64_t win, int nctx) {
+    layout(rank, world, EL, TCAP, H, I, TOPK, true);
+    TORCH_CHECK(int(peers.size()) == world, "one peer pointer per rank");
+    TORCH_CHECK(mask == 0 || (SM120_FP4_GIN && comm != 0 && nctx > 0), "GIN peers need the GIN build and a device "
+                "communicator with GIN contexts");
+    g.local_alloc = reinterpret_cast<void *>(base);
+    for (int w = 0; w < world; ++w) {
+        TORCH_CHECK(((mask >> w) & 1) == (peers[w] == 0), "rank ", w, ": a GIN peer has no pointer, a P2P peer has one");
+        g.peer_base[w] = w == rank ? g.local_alloc : reinterpret_cast<void *>(peers[w]);
+    }
+    g.gin_mask = uint32_t(mask), g.gin_comm = reinterpret_cast<const void *>(comm);
+    g.gin_win = reinterpret_cast<void *>(win), g.gin_nctx = nctx;
+    setup_local();
 }
 
 int grid_size(int nt) { return g.grid[nt]; }
@@ -890,6 +1082,7 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     a.ctr = g.ctr;
     a.stamps = stamps.has_value() ? reinterpret_cast<unsigned long long *>(stamps->data_ptr()) : nullptr;
     for (int w = 0; w < g.world; ++w) {
+        if (!g.peer_base[w]) continue;  // GIN peer
         uint8_t *b = static_cast<uint8_t *>(g.peer_base[w]);
         a.peers.pool_x[w] = b + g.off_pool_x;
         a.peers.pool_xs[w] = reinterpret_cast<uint32_t *>(b + g.off_pool_xs);
@@ -899,6 +1092,13 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
         a.peers.comb_flag[w] = reinterpret_cast<int *>(b + g.off_cflag);
         a.peers.route[w] = reinterpret_cast<int *>(b + g.off_route);
         a.peers.route_flag[w] = reinterpret_cast<int *>(b + g.off_rtflag);
+    }
+    if (g.gin_mask) {
+        uint8_t *b = static_cast<uint8_t *>(g.local_alloc);
+        a.gin = Gin{g.gin_comm, g.gin_win, g.gin_mask, g.gin_nctx, g.off_pool_x, g.off_pool_xs, g.off_meta,
+                    g.off_comb, g.off_route, g.st_route, g.st_x, g.st_xs, g.st_meta, g.st_comb,
+                    reinterpret_cast<int *>(b + g.st_route), b + g.st_x, b + g.st_xs,
+                    reinterpret_cast<int *>(b + g.st_meta), reinterpret_cast<__nv_bfloat16 *>(b + g.st_comb)};
     }
     a.T = int(x.size(0));
     TORCH_CHECK(a.T <= g.TCAP, "T exceeds TCAP");
@@ -924,6 +1124,8 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("init", &init);
     m.def("open_peers", &open_peers);
+    m.def("window_bytes", &window_bytes);
+    m.def("init_window", &init_window);
     m.def("grid_size", &grid_size);
     m.def("counters", &counters);
     m.def("run", &run);

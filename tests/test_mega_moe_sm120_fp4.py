@@ -6,6 +6,8 @@
 #   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 512
 #       cold-L2 kernel time, README shape, global M tokens (TILE=8/16 forces the tokens per item); `w4a8` is this
 #       kernel with MXFP8 activations; `stamps` instead of `bench` prints the per-phase kernel stamps
+#   Either mode takes a transport among its arguments (p2p, the default / auto / nic: every other rank over the NIC
+#   with NCCL GIN, which a single host can exercise), e.g. `verify mxfp4 small nic`.
 # The reference applies the kernel's quantization to the activations and to the SwiGLU output:
 #   MXFP4: per 32, scale 2^ceil(log2(amax/6)), E2M1 round-to-nearest-even.
 #   W4A8: per 32, scale 2^ceil(log2(amax/448)), E4M3.
@@ -120,11 +122,11 @@ def kernel_inputs(fmt, experts):
     return l1, l2, gs
 
 
-def verify(fmt, shape, rank, world, group):
+def verify(fmt, shape, rank, world, group, transport):
     h, i, e, topk = SHAPES[shape]
     el = e // world
     l1, l2, gs = kernel_inputs(fmt, [expert_codes(rank * el + j, h, i, fmt) for j in range(el)])
-    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, 64, topk, h, i)
+    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, 64, topk, h, i, transport)
     worst = 0.0
     for trial, t in enumerate([1, 3, 8, 13, 64] if shape == 'small' else [1, 3, 13, 40]):
         ids, wts = routing(t, e, topk, 77 + 10 * trial + rank)
@@ -144,15 +146,16 @@ def verify(fmt, shape, rank, world, group):
     w = torch.tensor([worst], device='cuda')
     dist.all_reduce(w, op=dist.ReduceOp.MAX)
     if rank == 0:
-        print(f'{fmt} {shape} EP{world} VERIFY max rel_l2 {w.item():.2e}', 'PASS' if w.item() < 2e-2 else 'FAIL',
-              flush=True)
+        print(f'{fmt} {shape} EP{world} {transport} VERIFY max rel_l2 {w.item():.2e}',
+              'PASS' if w.item() < 2e-2 else 'FAIL', flush=True)
+    buf.destroy()
 
 
 STAMPS = [(8, 'route-push'), (1, 'dispatched'), (12, 'flag-sent'), (9, 'route-ok'), (10, 'map-ok'), (2, 'rows-ok'),
           (14, 'first-FC2'), (13, 'last-FC1'), (15, 'comb-release'), (3, 'work-end'), (4, 'comb-ok'), (5, 'end')]
 
 
-def bench(fmt, rank, world, group, ms, stamps=False):
+def bench(fmt, rank, world, group, ms, transport, stamps=False):
     """README shape and method (the H20 / B200 tables' L2 flush): global M tokens over the
     ranks (one row per rank up to M = world), balanced routing expert = s * EL + (g + 7 s) % EL with weight 1/top-k.
     Cold L2: 256 MB written before each graph replay, ranks released by a barrier, median of 30 replays, median over
@@ -169,7 +172,7 @@ def bench(fmt, rank, world, group, ms, stamps=False):
     tile = int(os.environ.get('TILE', '0'))
     gs = fp4.nvfp4_global_scales(A1, A2, torch.full((el,), 0.06, device='cuda'),
                                  torch.full((el,), 0.06, device='cuda')) if fmt == 'nvfp4' else None
-    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, cap, topk, h, i)
+    buf = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, cap, topk, h, i, transport)
     run_fn = lambda y, x, ids, w, st=None: fp4.fp4_mega_moe_sm120(y, x, ids, w, l1, l2, buf, gs,
                                                                   activation_clamp=LIMIT, tile_tokens=tile, stamps=st)
     flush = torch.empty(256 << 20, dtype=torch.uint8, device='cuda')
@@ -235,15 +238,18 @@ def bench(fmt, rank, world, group, ms, stamps=False):
         allus = [torch.zeros_like(us) for _ in range(world)]
         dist.all_gather(allus, us)
         if rank == 0:
-            print(f'{fmt} readme EP{world} tile {tile or "auto"} M{m} (T/rank {rows}): gpu0 cold '
+            print(f'{fmt} readme EP{world} {transport} tile {tile or "auto"} M{m} (T/rank {rows}): gpu0 cold '
                   f'{allus[0].item():.1f} us | max-rank {max(a.item() for a in allus):.1f}', flush=True)
         del graph
         torch.cuda.synchronize()
         dist.barrier()
+    buf.destroy()
 
 
 def main():
     mode, fmt, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+    transport = next((a for a in args if a in fp4.TRANSPORTS), 'p2p')
+    args = [a for a in args if a not in fp4.TRANSPORTS]
     local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(local_rank)
     dist.init_process_group('nccl', device_id=torch.device('cuda', local_rank))
@@ -252,9 +258,9 @@ def main():
         fp4._ext(fmt)
     dist.barrier()
     if mode == 'verify':
-        verify(fmt, args[0] if args else 'small', rank, world, dist.group.WORLD)
+        verify(fmt, args[0] if args else 'small', rank, world, dist.group.WORLD, transport)
     else:
-        bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512],
+        bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512], transport,
               mode == 'stamps')
     dist.barrier()
     dist.destroy_process_group()

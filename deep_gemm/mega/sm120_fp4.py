@@ -1,5 +1,5 @@
 # SM120 (RTX PRO 6000 / 6000D) decode MegaMoE, W4A4: FP4 weights x FP4 activations, SwiGLU, top-k combine, EP over
-# PCIe P2P. Kernel: `include/deep_gemm/impls/sm120_fp4_mega_moe.cu`, one torch extension per format, built on first
+# PCIe P2P, or over the NIC (NCCL GIN) for the peers P2P cannot reach, e.g. on another host (`transport`). Kernel: `include/deep_gemm/impls/sm120_fp4_mega_moe.cu`, one torch extension per format, built on first
 # use for sm_120a:
 #   * 'mxfp4': E2M1 with a UE8M0 scale per 32 values (weights and activations).
 #   * 'nvfp4': E2M1 with a UE4M3 scale per 16 values, plus fp32 global dequant scales: one per expert for W13 and W2
@@ -19,33 +19,66 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
-_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    'include', 'deep_gemm', 'impls', 'sm120_fp4_mega_moe.cu')
+_IMPLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'include', 'deep_gemm', 'impls')
+_SRC = os.path.join(_IMPLS, 'sm120_fp4_mega_moe.cu')
+_GIN_SRC = os.path.join(_IMPLS, 'sm120_fp4_mega_moe_gin.cu')  # NIC transport session (host only)
 FORMATS = {'mxfp4': 32, 'nvfp4': 16, 'w4a8': 32}  # format -> values per block scale
+# 'p2p': every peer over PCIe P2P (cudaIpc). 'auto': the buffer is an NCCL window; the peers NCCL maps for load/store
+# (same host) over P2P, the others (another host) over the NIC with NCCL GIN puts. 'nic': every other rank over GIN.
+TRANSPORTS = ('p2p', 'auto', 'nic')
+# NCCL GIN type -> (name, the defines that keep only that backend's device code)
+_GIN_BUILDS = {2: ('proxy', ['-DNCCL_GIN_GDAKI_ENABLE=0', '-DNCCL_GIN_GPI_ENABLE=0']),
+               3: ('gdaki', ['-DNCCL_GIN_PROXY_ENABLE=0', '-DNCCL_GIN_GPI_ENABLE=0']),
+               4: ('gpi', ['-DNCCL_GIN_PROXY_ENABLE=0', '-DNCCL_GIN_GDAKI_ENABLE=0'])}
+_GIN_CONTEXTS = 4  # GIN queue-pair sets the CTAs spread their puts over
 _EXT = {}
 _KEY = {}
 
 
-def _ext(fmt: str):
+def _nccl():  # NCCL headers with the Device API and the library, from the nvidia-nccl wheel torch uses
+    import nvidia.nccl
+    root = list(nvidia.nccl.__path__)[0]
+    include, library = os.path.join(root, 'include'), os.path.join(root, 'lib', 'libnccl.so.2')
+    if not (os.path.isfile(os.path.join(include, 'nccl_device.h')) and os.path.isfile(library)):
+        raise RuntimeError(f'the NIC transport needs NCCL with the Device API (nccl_device.h, libnccl.so.2) in {root}')
+    return include, library
+
+
+def _build(name: str, source: str, cflags, nccl: bool):
     # environment variables: sm120_6000d/ENV.md
-    if fmt not in _EXT:
-        name = f'sm120_fp4_mega_moe_{fmt}'
-        so = os.environ.get(f'DG_SM120_FP4_MEGA_MOE_SO_{fmt.upper()}')
+    from torch.utils.cpp_extension import load
+    build_dir = os.path.join(os.environ.get('DG_SM120_MEGA_MOE_BUILD_DIR',
+                                            os.path.join(os.path.expanduser('~'), '.deep_gemm', 'sm120_mega_moe')), name)
+    os.makedirs(build_dir, exist_ok=True)
+    extra = {}
+    if nccl:
+        include, library = _nccl()
+        extra = dict(extra_include_paths=[include], extra_ldflags=[library, f'-Wl,-rpath,{os.path.dirname(library)}'])
+    return load(name=name, sources=[source], build_directory=build_dir,
+                extra_cuda_cflags=['-gencode=arch=compute_120a,code=sm_120a', '-O3', '-std=c++20', *cflags], **extra)
+
+
+def _ext(fmt: str, gin_type: int = 0):
+    # gin_type: an NCCL GIN type of _GIN_BUILDS (a build with the NIC transport), 0 = P2P only
+    key = (fmt, gin_type)
+    if key not in _EXT:
+        name = f'sm120_fp4_mega_moe_{fmt}' + (f'_gin_{_GIN_BUILDS[gin_type][0]}' if gin_type else '')
+        so = None if gin_type else os.environ.get(f'DG_SM120_FP4_MEGA_MOE_SO_{fmt.upper()}')
         if so:
             spec = importlib.util.spec_from_file_location(name, so)
-            _EXT[fmt] = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(_EXT[fmt])
+            _EXT[key] = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_EXT[key])
         else:
-            from torch.utils.cpp_extension import load
-            build_dir = os.path.join(os.environ.get('DG_SM120_MEGA_MOE_BUILD_DIR',
-                                                    os.path.join(os.path.expanduser('~'), '.deep_gemm', 'sm120_mega_moe')),
-                                     name)
-            os.makedirs(build_dir, exist_ok=True)
-            _EXT[fmt] = load(name=name, sources=[_SRC], build_directory=build_dir,
-                             extra_cuda_cflags=['-gencode=arch=compute_120a,code=sm_120a', '-O3', '-std=c++20',
-                                                '--use_fast_math', f'-DSM120_FP4_NV={int(fmt == "nvfp4")}',
-                                                f'-DSM120_FP4_A8={int(fmt == "w4a8")}'])
-    return _EXT[fmt]
+            gin = ['-DSM120_FP4_GIN=1', '-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE', *_GIN_BUILDS[gin_type][1]] if gin_type else []
+            _EXT[key] = _build(name, _SRC, ['--use_fast_math', f'-DSM120_FP4_NV={int(fmt == "nvfp4")}',
+                                            f'-DSM120_FP4_A8={int(fmt == "w4a8")}', *gin], bool(gin_type))
+    return _EXT[key]
+
+
+def _gin_session():
+    if 'session' not in _EXT:
+        _EXT['session'] = _build('sm120_fp4_mega_moe_gin_session', _GIN_SRC, [], True)
+    return _EXT['session']
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -126,11 +159,14 @@ def _clamp(activation_clamp: Optional[float]) -> float:
 # ----------------------------------------------------------------------------------------------------------------------
 
 class Sm120Fp4MegaMoeBuffer:
-    """Peer-visible pools (expert inputs, routing, combine) of this rank, opened by every peer over cudaIpc."""
+    """Peer-visible pools (expert inputs, routing, combine) of this rank: one cudaMalloc opened by every peer over
+    cudaIpc ('p2p'), or one NCCL window ('auto' / 'nic', see TRANSPORTS; the group must be a ProcessGroupNCCL).
+    Collective; build it before CUDA graph capture."""
 
     def __init__(self, group: dist.ProcessGroup, fmt: str, num_experts: int, num_max_tokens_per_rank: int,
-                 num_topk: int, hidden: int, intermediate_hidden: int):
+                 num_topk: int, hidden: int, intermediate_hidden: int, transport: str = 'p2p'):
         assert fmt in FORMATS, fmt
+        assert transport in TRANSPORTS, transport
         self.group, self.fmt = group, fmt
         self.rank, self.world = group.rank(), group.size()
         assert num_experts % self.world == 0
@@ -140,19 +176,68 @@ class Sm120Fp4MegaMoeBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.transport = 'p2p' if self.world == 1 else transport
         key = (self.rank, self.world, self.num_local_experts, num_max_tokens_per_rank, hidden, intermediate_hidden,
                num_topk)
         if fmt not in _KEY:
-            handle = _ext(fmt).init(*key)
-            handles = [None] * self.world
-            dist.all_gather_object(handles, handle, group=group)
-            _ext(fmt).open_peers(handles)
-            _KEY[fmt] = key
-        assert _KEY[fmt] == key, f'one SM120 {fmt} MegaMoE buffer per process: {_KEY[fmt]} vs {key}'
+            if self.transport == 'p2p':
+                ext = _ext(fmt)
+                handle = ext.init(*key)
+                handles = [None] * self.world
+                dist.all_gather_object(handles, handle, group=group)
+                ext.open_peers(handles)
+            else:
+                ext = self._init_window(key)
+            _KEY[fmt] = (key + (self.transport,), ext)
+        assert _KEY[fmt][0] == key + (self.transport,), f'one SM120 {fmt} MegaMoE buffer per process: {_KEY[fmt][0]}'
+        self.ext = _KEY[fmt][1]
+
+    def _init_window(self, key):
+        """The buffer as one NCCL symmetric window: P2P to the peers NCCL maps for load/store ('auto'), NCCL GIN
+        through the NIC to the others, or to every other rank ('nic')."""
+        group, rank, world = self.group, self.rank, self.world
+        dist.barrier(group=group)  # ProcessGroupNCCL creates its communicator lazily
+        backend = group._get_backend(torch.device('cuda'))
+        if not hasattr(backend, '_comm_ptr'):
+            raise RuntimeError(f"transport '{self.transport}' needs a ProcessGroupNCCL group")
+        comm = int(backend._comm_ptr())
+        session = _gin_session()
+        gin_type = int(session.gin_type(comm, rank, world))
+        handle = session.create(comm, rank, world, int(_ext(self.fmt).window_bytes(*key)), _GIN_CONTEXTS)
+        base, win, dev_comm, contexts = (int(v) for v in session.info(handle))
+        peers = [int(p) for p in session.peers(handle)]
+        mask = 0
+        for w in range(world):
+            if w != rank and (self.transport == 'nic' or peers[w] == 0):
+                mask |= 1 << w
+        masks = [None] * world  # a pair sends and receives over the same transport: the masks must agree
+        dist.all_gather_object(masks, mask, group=group)
+        for w in range(world):
+            if (mask >> w & 1) != (masks[w] >> rank & 1):
+                raise RuntimeError(f'ranks {rank} and {w} disagree on the transport between them')
+        if mask and (dev_comm == 0 or gin_type not in _GIN_BUILDS):
+            raise RuntimeError(f'ranks {[w for w in range(world) if mask >> w & 1]} need the NIC, but the NCCL '
+                               f'communicator offers no supported GIN (type {gin_type})')
+        ext = _ext(self.fmt, gin_type if mask else 0)  # without GIN peers the build without the GIN code (faster)
+        ext.init_window(*key, base, [0 if mask >> w & 1 else peers[w] for w in range(world)], mask, dev_comm, win,
+                        contexts)
+        self.gin_mask = mask
+        self._session = (session, handle)
+        dist.barrier(group=group)
+        return ext
+
+    def destroy(self) -> None:
+        """Collective: release the NCCL window ('auto' / 'nic') before the process group is destroyed. The buffer of
+        this format is unusable afterwards."""
+        session = getattr(self, '_session', None)
+        if session is not None:
+            torch.cuda.synchronize()
+            session[0].destroy(session[1])
+            self._session = None
 
     def error(self) -> int:
         """Non-zero after a spin wait timed out (peer missing or stuck)."""
-        return int(_ext(self.fmt).counters()[3])
+        return int(self.ext.counters()[3])
 
 
 def fp4_mega_moe_sm120(y: torch.Tensor,
@@ -173,8 +258,7 @@ def fp4_mega_moe_sm120(y: torch.Tensor,
     from the expected tokens per local expert. Every rank of the group must call it."""
     assert x.shape[0] <= sym_buffer.num_max_tokens_per_rank
     assert (global_scales is not None) == (sym_buffer.fmt == 'nvfp4')
-    _ext(sym_buffer.fmt).run(x.to(torch.bfloat16).contiguous(), topk_idx.to(torch.int32).contiguous(),
-                             topk_weights.to(torch.float32).contiguous(), y, l1_weights[0], l1_weights[1],
-                             l2_weights[0], l2_weights[1], global_scales, _clamp(activation_clamp), tile_tokens,
-                             stamps)
+    sym_buffer.ext.run(x.to(torch.bfloat16).contiguous(), topk_idx.to(torch.int32).contiguous(),
+                       topk_weights.to(torch.float32).contiguous(), y, l1_weights[0], l1_weights[1], l2_weights[0],
+                       l2_weights[1], global_scales, _clamp(activation_clamp), tile_tokens, stamps)
     return y
