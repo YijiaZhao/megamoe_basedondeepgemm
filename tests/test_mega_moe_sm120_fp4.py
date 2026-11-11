@@ -1,8 +1,9 @@
 # SM120 W4A4 MegaMoE (deep_gemm/mega/sm120_fp4.py): MXFP4 and NVFP4.
-#   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py verify mxfp4 [small|readme]
+#   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py verify mxfp4 [small|readme|wide]
 #       EP vs a quantization-exact reference, every tokens-per-item width (small: H512 / I256 / E128 / top-6;
-#       readme: the README shape H3072 / I1280 / E384 / top-8)
-#   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 1024
+#       readme: the README shape H3072 / I1280 / E384 / top-8; wide: H5120 / I256 / E128 / top-6, the token goes
+#       out in several dispatch chunks)
+#   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 512
 #       cold-L2 kernel time, README shape, global M tokens (TILE=8/16 forces the tokens per item); `w4a8` is this
 #       kernel with MXFP8 activations; `stamps` instead of `bench` prints the per-phase kernel stamps
 # The reference applies the kernel's quantization to the activations and to the SwiGLU output:
@@ -104,6 +105,7 @@ def routing(t, e, k, seed):
 SHAPES = {  # hidden, intermediate, experts, top-k
     'small': (512, 256, 128, 6),
     'readme': (3072, 1280, 384, 8),  # the README's validated shape (48 local experts at EP8)
+    'wide': (5120, 256, 128, 6),
 }
 
 
@@ -252,7 +254,7 @@ def main():
     if mode == 'verify':
         verify(fmt, args[0] if args else 'small', rank, world, dist.group.WORLD)
     else:
-        bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512, 1024],
+        bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512],
               mode == 'stamps')
     dist.barrier()
     dist.destroy_process_group()

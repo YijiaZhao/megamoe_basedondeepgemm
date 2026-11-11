@@ -182,8 +182,10 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
 #pragma unroll
         for (int s = 0; s < NT; ++s) acc[j][s][0] = acc[j][s][1] = acc[j][s][2] = acc[j][s][3] = 0.f;
     constexpr int kSw = kNv ? kUnroll : kUnroll / 2;  // scale words per unrolled step
-    // double-buffered: the next step's weights and scales are in flight while this step's MMAs run (cold L2: the
-    // loop is bound by DRAM latency, and the compiler does not reliably hoist the loads by itself)
+    // cold L2: the loop waits on DRAM. With one MMA per weight fragment (NT 1) the next step's weights and scales are
+    // loaded explicitly while this step's MMAs run; with NT MMAs per fragment two unrolled steps cover the latency,
+    // and a second buffer only costs registers
+    constexpr bool kDb = NT == 1;
     uint4 wv[kNbPerWarp][kUnroll], wn[kNbPerWarp][kUnroll];
     uint32_t sfa[kNbPerWarp][kSw], sfn[kNbPerWarp][kSw];
     auto load = [&](int k0, uint4 (&w)[kNbPerWarp][kUnroll], uint32_t (&sf)[kNbPerWarp][kSw]) {
@@ -196,9 +198,14 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
 #pragma unroll
             for (int j = 0; j < kNbPerWarp; ++j) sf[j][q] = __ldg(sp[j] + (k0 * kSw / kUnroll + q) * 16);
     };
-    load(0, wv, sfa);
+    if constexpr (kDb) load(0, wv, sfa);
+#pragma unroll 2
     for (int k0 = 0; k0 < kch; k0 += kUnroll) {
-        if (k0 + kUnroll < kch) load(k0 + kUnroll, wn, sfn);
+        if constexpr (kDb) {
+            if (k0 + kUnroll < kch) load(k0 + kUnroll, wn, sfn);
+        } else {
+            load(k0, wv, sfa);
+        }
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
             const int kc = k0 + u;
@@ -240,12 +247,14 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
                 for (int s = 0; s < NT; ++s) mma_fp4(acc[j][s], wv[j][u], b0[s], b1[s], sa, sfb[s]);
             }
         }
+        if constexpr (kDb) {
 #pragma unroll
-        for (int j = 0; j < kNbPerWarp; ++j) {
+            for (int j = 0; j < kNbPerWarp; ++j) {
 #pragma unroll
-            for (int u = 0; u < kUnroll; ++u) wv[j][u] = wn[j][u];
+                for (int u = 0; u < kUnroll; ++u) wv[j][u] = wn[j][u];
 #pragma unroll
-            for (int q = 0; q < kSw; ++q) sfa[j][q] = sfn[j][q];
+                for (int q = 0; q < kSw; ++q) sfa[j][q] = sfn[j][q];
+            }
         }
     }
 }
@@ -359,7 +368,9 @@ __device__ __forceinline__ void item_decode(int item, int ntiles, int nblk1, int
 __device__ __forceinline__ int first_item(unsigned block, unsigned grid) { return int(grid - 1 - block); }
 
 template <int NT>  // tokens per item: NT x 8
-__global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a) {
+// two CTAs per SM (the grid is sized from the occupancy): the register budget is 128, which the unrolled weight loop
+// uses to keep loads in flight
+__global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args a) {
     constexpr int kT = kTile * NT;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int H = a.H, I = a.I, EL = a.EL, W = a.W, TOPK = a.TOPK, TCAP = a.TCAP;
@@ -426,30 +437,14 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
         }
     }
 
-    // ---------------- dispatch: one CTA per token: quantize once to FP4 in smem, push TOPK copies with every thread
+    // ---------------- dispatch: one CTA per token: quantize once in smem, push TOPK copies with every thread. The
+    // token goes in chunks of kDispGroups scale groups (values, then scale bytes), so any H fits s_tile
     {
-        uint8_t *s_q = reinterpret_cast<uint8_t *>(&s_tile[0][0]);  // [H/kXB] values, then [H/kSfVec] scale bytes
-        uint8_t *s_sc = s_q + H / kXB;
+        constexpr int kDispGroups = (kTile * kRowsPerItem * 4 / (kSfVec / kXB + 1)) / 16 * 16;
+        uint8_t *s_q = reinterpret_cast<uint8_t *>(&s_tile[0][0]);  // [chunk values], then [chunk scale bytes]
+        uint8_t *s_sc = s_q + kDispGroups * kSfVec / kXB;
         __shared__ int s_rowk[8], s_dstk[8];
         for (int t = blockIdx.x; t < a.T; t += gridDim.x) {
-            for (int gi = threadIdx.x; gi < H / kSfVec; gi += blockDim.x) {  // one thread per scale group
-                const uint4 *s4 = reinterpret_cast<const uint4 *>(a.x + size_t(t) * H + gi * kSfVec);
-                float v[kSfVec];
-#pragma unroll
-                for (int q = 0; q < kSfVec / 8; ++q) {
-                    const uint4 u = s4[q];
-                    const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&u);
-#pragma unroll
-                    for (int r = 0; r < 4; ++r) {
-                        const float2 f = __bfloat1622float2(b2[r]);
-                        v[q * 8 + r * 2] = f.x;
-                        v[q * 8 + r * 2 + 1] = f.y;
-                    }
-                }
-                uint32_t q4[kQW];
-                s_sc[gi] = quant_fp4(v, q4, ginv1);
-                store_q(s_q + gi * (kSfVec / kXB), q4);
-            }
             if (warp < TOPK) {  // warp k: destination row of copy k (slot = tokens t' < t routed to the same expert)
                 const int e = a.topk_ids[t * TOPK + warp];  // < 0: padding token, nothing to send
                 int slot = 0;
@@ -468,21 +463,43 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_fp4_mega_moe_kernel(Args a)
                     }
                 }
             }
-            __syncthreads();
-            const int nq = H / kXB / 16, per = nq + H / kSfVec / 16;  // uint4 per copy: data + scales
-            for (int u = threadIdx.x; u < TOPK * per; u += blockDim.x) {
-                const int k = u / per, q = u % per;
-                if (s_rowk[k] < 0) continue;
-                const size_t row = size_t(s_rowk[k]);
-                const int dst = s_dstk[k];
-                if (q < nq)
-                    reinterpret_cast<uint4 *>(a.peers.pool_x[dst] + row * (H / kXB))[q] =
-                        reinterpret_cast<const uint4 *>(s_q)[q];
-                else
-                    reinterpret_cast<uint4 *>(a.peers.pool_xs[dst] + row * (H / kSfWordK))[q - nq] =
-                        reinterpret_cast<const uint4 *>(s_sc)[q - nq];
+            for (int g0 = 0; g0 < H / kSfVec; g0 += kDispGroups) {
+                const int ng = min(kDispGroups, H / kSfVec - g0);
+                for (int gi = threadIdx.x; gi < ng; gi += blockDim.x) {  // one thread per scale group
+                    const uint4 *s4 = reinterpret_cast<const uint4 *>(a.x + size_t(t) * H + (g0 + gi) * kSfVec);
+                    float v[kSfVec];
+#pragma unroll
+                    for (int q = 0; q < kSfVec / 8; ++q) {
+                        const uint4 u = s4[q];
+                        const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&u);
+#pragma unroll
+                        for (int r = 0; r < 4; ++r) {
+                            const float2 f = __bfloat1622float2(b2[r]);
+                            v[q * 8 + r * 2] = f.x;
+                            v[q * 8 + r * 2 + 1] = f.y;
+                        }
+                    }
+                    uint32_t q4[kQW];
+                    s_sc[gi] = quant_fp4(v, q4, ginv1);
+                    store_q(s_q + gi * (kSfVec / kXB), q4);
+                }
+                __syncthreads();
+                const int nq = ng * kSfVec / kXB / 16, per = nq + ng / 16;  // uint4 per copy: data + scales
+                const int oq = g0 * kSfVec / kXB / 16, os = g0 / 16;      // the chunk's uint4 offsets in the row
+                for (int u = threadIdx.x; u < TOPK * per; u += blockDim.x) {
+                    const int k = u / per, q = u % per;
+                    if (s_rowk[k] < 0) continue;
+                    const size_t row = size_t(s_rowk[k]);
+                    const int dst = s_dstk[k];
+                    if (q < nq)
+                        reinterpret_cast<uint4 *>(a.peers.pool_x[dst] + row * (H / kXB))[oq + q] =
+                            reinterpret_cast<const uint4 *>(s_q)[q];
+                    else
+                        reinterpret_cast<uint4 *>(a.peers.pool_xs[dst] + row * (H / kSfWordK))[os + q - nq] =
+                            reinterpret_cast<const uint4 *>(s_sc)[q - nq];
+                }
+                __syncthreads();
             }
-            __syncthreads();
         }
     }
     __threadfence_system();
@@ -798,8 +815,7 @@ static size_t align_up(size_t v) { return (v + 255) & ~size_t(255); }
 // returns this rank's cudaIpcMemHandle bytes
 torch::Tensor init(int rank, int world, int EL, int TCAP, int H, int I, int TOPK) {
     TORCH_CHECK(world <= kMaxWorld && EL <= kMaxEl && TOPK <= 8, "world / experts / top-k out of range");
-    TORCH_CHECK(H % kRowsPerItem == 0 && I % kRowsPerItem == 0 && H % (16 * kSfVec) == 0 &&
-                    H / kXB + H / kSfVec <= kTile * kRowsPerItem * 4,
+    TORCH_CHECK(H % kRowsPerItem == 0 && I % kRowsPerItem == 0 && H % (16 * kSfVec) == 0,
                 "unsupported hidden / intermediate size");
     g.rank = rank, g.world = world, g.EL = EL, g.TCAP = TCAP, g.H = H, g.I = I, g.TOPK = TOPK;
     const size_t rows = size_t(EL) * world * TCAP;
@@ -892,9 +908,9 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
         const float per_expert = float(a.T) * a.TOPK / a.EL;
-        // swept on 6000D EP8, cold L2, 1-128 tokens per rank: W4A4 is fastest at 16 throughout; W4A8 (two MMAs per K64)
-        // at 8, and at 16 around 64 tokens per rank
-        nt = !kA8 || (per_expert > 8.f && per_expert <= 16.f) ? 2 : 1;
+        // swept on 6000D EP8, cold L2, 1-64 tokens per rank, every format: 8 while one sub-tile holds an expert's
+        // tokens, 16 beyond
+        nt = per_expert > 8.f ? 2 : 1;
     }
     TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8 or 16");
     auto stream = c10::cuda::getCurrentCUDAStream();
