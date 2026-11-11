@@ -16,6 +16,13 @@ GPU 0, median of the last 3 of 30 streamed replays, µs at global M = 2 / 4 / 8 
 | 8x B200 (1965 MHz) | W-MXFP4 x A-FP8, `sm100_b200/` | 35.7 | 38.9 | 46.1 | 54.0 |
 | 8x H20-3e (1830 MHz) | MXFP4 fused | 38.8 | 47.4 | 56.7 | 76.2 |
 | 8x H20-3e (1830 MHz) | QoQ (W4A8-int) fused | 37.1 | 45.2 | 54.0 | 72.6 |
+| 8x RTX 6000D (PCIe P2P) | W4A8 (MXFP4 x MXFP8), `sm120_6000d/` | 43.6 | 57.7 | 78.6 | 116.3 |
+| 8x RTX 6000D (PCIe P2P) | W4A4 MXFP4, `sm120_6000d/` | 43.8 | 57.2 | 78.4 | 115.0 |
+| 8x RTX 6000D (PCIe P2P) | W4A4 NVFP4, `sm120_6000d/` | 46.8 | 60.8 | 81.3 | 120.8 |
+
+The RTX 6000D rows are timed with CUDA events instead of nsys: CUDA graph replays, 256 MB written before each replay
+(cold L2), median of 30, clocks not locked. Their test host (PCIe and NIC topology) is described under
+[SM120 test host](#sm120-test-host-8x-rtx-6000d); the times depend on it.
 
 ## Execution model: split (two kernels) versus fused (one kernel)
 
@@ -168,6 +175,44 @@ Global M:     2, 4, 8, 16
 
 Architecture diagram: [`docs/H20_FOUR_API_FUSED_ARCHITECTURE.html`](docs/H20_FOUR_API_FUSED_ARCHITECTURE.html).
 
+### SM120 test host (8x RTX 6000D)
+
+Every RTX 6000D number in this repository comes from this host. The kernel moves tokens and partials over PCIe P2P (no
+NVLink), so its times depend on the PCIe fabric below; another 6000D host with a different fabric gives other times.
+
+| Item | Configuration |
+|---|---|
+| GPU | 8 x NVIDIA RTX 6000D, SM120 (`sm_120a`), 156 SMs, 112 MiB L2, 85651 MiB |
+| GPU clock | not locked (SM up to 2430 MHz), 600 W power limit |
+| GPU link | PCIe Gen5 x16 each |
+| CPU | 2 x AMD EPYC 9575F (64 cores each); GPUs 0-3 on socket 0, GPUs 4-7 on socket 1 |
+| PCIe switches | one Broadcom PEX890xx switch per GPU pair: GPU 0-1, 2-3, 4-5, 6-7; each switch also holds one ConnectX-8 NIC |
+| NICs | 4 x ConnectX-8, one port up each at 400 Gb/s Ethernet (RoCE); each port is its own /31 link to the fabric |
+| Driver / CUDA | 580.95.05 / 13.0 |
+| Container | `toklin/vllm-sm120:e10ecb6bd-p3` (PyTorch 2.14.0+cu130, NCCL 2.30.7 `nvidia-nccl-cu13`) |
+
+GPU-GPU and GPU-NIC paths (`nvidia-smi topo -m`):
+
+| Pair | Path | Measured (NCCL send / recv, one pair, 64 MB) |
+|---|---|---|
+| GPU 0-1, 2-3, 4-5, 6-7 | PIX: through their shared PCIe switch | 50.5 GB/s |
+| two GPUs on one socket, different switches | NODE: through the socket's root complex | 50.4 GB/s |
+| GPUs on different sockets | SYS: across the CPU interconnect | 45.9 GB/s |
+| GPUs on different sockets, over the NIC (`mlx5_0`) | GPU -> NIC -> fabric -> NIC -> GPU | 27.7 GB/s |
+
+| NIC (RDMA device) | Netdev | PCIe | Next to GPUs | Socket |
+|---|---|---|---|---|
+| `mlx5_0` | `ens8f0np0` | 07:00.0 | 0-1 (PIX) | 0 |
+| `mlx5_2` | `enp117s0f0np0` | 75:00.0 | 2-3 (PIX) | 0 |
+| `mlx5_4` | `enp131s0f0np0` | 83:00.0 | 4-5 (PIX) | 1 |
+| `mlx5_6` | `enp245s0f0np0` | f5:00.0 | 6-7 (PIX) | 1 |
+
+The second port of each card (`mlx5_1/3/5/7`) is down; `mlx5_bond_0` is the management bond. The four ports sit on
+different subnets and not every pair of them reaches the other (`mlx5_0` reaches `mlx5_2`, not `mlx5_6`), so the
+single-host NIC measurements pin every rank to one port, `NCCL_IB_HCA==mlx5_0`
+([sm120_6000d/ENV.md](sm120_6000d/ENV.md)): those NIC numbers are one shared NIC's bandwidth, not this host's four.
+Within this host P2P is the faster path; the NIC transport is for ranks on another host.
+
 ### Clean-host Docker quick start
 
 The validated image is pinned by digest:
@@ -292,15 +337,17 @@ Per-platform result documents (one table + measurement method + reproduce each):
 | 8x B200 (SM100, 1965 MHz) | Upstream baseline: [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) main `78b6900` W-MXFP4xA-FP8 `fp8xfp4` MegaMoE, kernel unmodified | 47.2 / 50.5 / 53.2 / 61.2 | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x B200 (SM100, 1965 MHz) | **E2E** (frontend kernel + forced-balanced memcpy + MegaMoE, one CUDA graph): W-MXFP4xA-FP8 / W4A4 MXFP4 / W4A4 NVFP4 | 44.0 / 48.5 / 53.8 / 63.0 (FP8 act), 40.8 / 44.8 / 51.5 / 58.9 (MXFP4), 41.7 / 46.4 / 52.3 / 60.0 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x H20-3e (SM90, 1830 MHz) | **E2E** (same graph, padding rows unrouted): MXFP4 / QoQ fused | 44.6 / 54.0 / 62.2 / 80.9 (MXFP4), 44.8 / 54.2 / 60.4 / 80.6 (QoQ) | [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) |
+| 8x RTX 6000D (SM120, PCIe P2P, clocks not locked) | W4A8 / W4A4 MXFP4 / W4A4 NVFP4 `fp4_mega_moe_sm120` (CUDA events, cold L2) | 43.6 / 57.7 / 78.6 / 116.3 (W4A8), 43.8 / 57.2 / 78.4 / 115.0 (MXFP4), 46.8 / 60.8 / 81.3 / 120.8 (NVFP4) | [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md) |
 
 Same model scale for all rows (E384 / 48 local, H3072, I1280, top-8, EP8) and the same forced-balanced routing; every column is the
-kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200). The E2E
+kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200;
+the RTX 6000D row: CUDA events, see below). The E2E
 rows span from the start of the frontend kernel (router + top-8 + softmax + activation quantisation) to the end of the MegaMoE
 kernel, with the forced-balanced routing written by one memcpy node in between (frontend sources for B200: `sm100_b200/fe_sm100/`). The two
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
-SM120 (8x RTX 6000D, PCIe P2P, no NVLink; CUDA-event timing, so not in the nsys table above): `fp4_mega_moe_sm120`,
+SM120 (8x RTX 6000D, PCIe P2P, no NVLink; host: [SM120 test host](#sm120-test-host-8x-rtx-6000d)): `fp4_mega_moe_sm120`,
 one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4, over PCIe P2P or, for peers on
 another host, the NIC (NCCL GIN), up to 16 ranks. This README's shape, EP8, cold L2
 (256 MB written before each replay), W4A8: 43.6 / 57.7 / 78.6 / 116.3 µs at M2 / 4 / 8 / 16; all formats, method and
