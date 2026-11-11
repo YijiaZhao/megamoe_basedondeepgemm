@@ -153,8 +153,8 @@ STAMPS = [(8, 'route-push'), (1, 'dispatched'), (12, 'flag-sent'), (9, 'route-ok
 def bench(fmt, rank, world, group, ms, stamps=False):
     """README shape and method (docs/SM120_MEGAMOE_RESULTS.md, ep_kernel_bench.py h20shape): global M tokens over the
     ranks (one row per rank up to M = world), balanced routing expert = s * EL + (g + 7 s) % EL with weight 1/top-k.
-    Cold L2: 256 MB written (COLD=read: read) before each graph replay, ranks released by a barrier, median of 30
-    replays, median over 3 passes."""
+    Cold L2: 256 MB written before each graph replay, ranks released by a barrier, median of 30 replays, median over
+    3 passes."""
     h, i, e, topk = SHAPES['readme']
     el = e // world
     gen = torch.Generator(device='cuda').manual_seed(20261023 + rank)
@@ -195,7 +195,7 @@ def bench(fmt, rank, world, group, ms, stamps=False):
             torch.cuda.synchronize()
             dist.barrier()
             for _ in range(8):
-                flush.sum() if os.environ.get('COLD') == 'read' else flush.fill_(1)
+                flush.fill_(1)
                 torch.cuda.synchronize()
                 dist.barrier()
                 graph.replay()
@@ -218,10 +218,7 @@ def bench(fmt, rank, world, group, ms, stamps=False):
         for _ in range(3):
             ts = []
             for k in range(32):
-                if os.environ.get('COLD') == 'read':  # L2 filled by reads of other data instead of writes
-                    flush.sum()
-                else:
-                    flush.fill_(k)
+                flush.fill_(k)
                 torch.cuda.synchronize()
                 dist.barrier()
                 a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
