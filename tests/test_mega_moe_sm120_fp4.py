@@ -153,7 +153,7 @@ STAMPS = [(8, 'route-push'), (1, 'dispatched'), (12, 'flag-sent'), (9, 'route-ok
 
 
 def bench(fmt, rank, world, group, ms, stamps=False):
-    """README shape and method (docs/SM120_MEGAMOE_RESULTS.md, ep_kernel_bench.py h20shape): global M tokens over the
+    """README shape and method (the H20 / B200 tables' L2 flush): global M tokens over the
     ranks (one row per rank up to M = world), balanced routing expert = s * EL + (g + 7 s) % EL with weight 1/top-k.
     Cold L2: 256 MB written before each graph replay, ranks released by a barrier, median of 30 replays, median over
     3 passes."""

@@ -2,8 +2,8 @@
 
 Expert-parallel MoE layer kernels for decode-size batches, built on DeepGEMM: four explicit
 Hopper/H20 APIs plus one shared Fable dynamic-M frontend, the Blackwell/B200 kernels under
-`sm100_b200/`, and the SM120 (RTX PRO 6000 / 6000D) EP and TP decode kernels (`mxfp4_mega_moe_sm120`,
-`mxfp4_moe_tp_sm120`). Split and Fused retain independent workspaces, layouts, schedulers, and ABI contracts.
+`sm100_b200/`, and the SM120 (RTX PRO 6000 / 6000D) EP decode kernel (`fp4_mega_moe_sm120`). Split and Fused retain
+independent workspaces, layouts, schedulers, and ABI contracts.
 
 Best measured MegaMoE kernel time (single kernel, forced-balanced, E384 / H3072 / I1280 / top-8 / EP8,
 GPU 0, median of the last 3 of 30 streamed replays, µs at global M = 2 / 4 / 8 / 16; full tables in
@@ -300,12 +300,10 @@ kernel, with the forced-balanced routing written by one memcpy node in between (
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
-SM120 (8x RTX 6000D, PCIe P2P, no NVLink; CUDA-event timing, so not in the nsys table above), against vLLM's Marlin
-MXFP4 MoE with NCCL all-gather / reduce-scatter on the same layout: the EP kernel's MoE layer is 21-29 % shorter on
-DeepSeek-V4-Flash EP4 (1-64 tokens per rank) and 1.8-3.1x faster on this README's shape at EP8 with cold L2 (`fp4_mega_moe_sm120` W4A8, which also runs W4A4
-MXFP4 / NVFP4: 43.6 / 57.7 / 78.6 / 116.3 µs at M2 / 4 / 8 / 16, [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md)); in Toklin
-CI AgentX the PD layout with the kernel on its DP4/EP4 decode worker gains 6-8 % throughput and 9-13 % ITL at CC32-80.
-Tables, per-phase stamps and the TP kernel: [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md).
+SM120 (8x RTX 6000D, PCIe P2P, no NVLink; CUDA-event timing, so not in the nsys table above): `fp4_mega_moe_sm120`,
+one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4. This README's shape, EP8, cold L2
+(256 MB written before each replay), W4A8: 43.6 / 57.7 / 78.6 / 116.3 µs at M2 / 4 / 8 / 16; all formats, method and
+correctness: [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md).
 
 ## Relevant source files
 
@@ -323,9 +321,6 @@ deep_gemm/include/deep_gemm/impls/fable_cc_select.cuh
 deep_gemm/include/deep_gemm/impls/sm90_mxfp4_mega_moe.cuh
 deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh
 deep_gemm/include/deep_gemm/impls/sm90_fp4_mega_moe_h20_fused_body.inl
-deep_gemm/include/deep_gemm/impls/sm120_mxfp4_mega_moe.cu
-deep_gemm/mega/sm120.py
-tests/test_mega_moe_sm120.py
 deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu
 deep_gemm/mega/sm120_fp4.py
 tests/test_mega_moe_sm120_fp4.py
