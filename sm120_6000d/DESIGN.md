@@ -157,16 +157,31 @@ grid = 每 SM 两个 CTA × SM 数（6000D：312 个 CTA）。每个 CTA 256 线
 
 ## 7. 传输层
 
-| `transport` | 显存 | 对端怎么到达 |
-|---|---|---|
-| `'p2p'`（默认） | 一块 `cudaMalloc`，`cudaIpc` 共享 | 所有对端都用 GPU 直接写（PCIe P2P） |
-| `'auto'` | 一块 NCCL 对称窗口 | NCCL 能映射的（同机）走 P2P，其它（另一台机器）走网卡 |
-| `'nic'` | 一块 NCCL 对称窗口 | 所有对端都走网卡（单机测试用） |
+`'p2p'`（默认）：一块 `cudaMalloc`，`cudaIpc` 共享，所有对端都用 GPU 直接写（PCIe P2P）。其它取值都是一块 NCCL
+对称窗口 + 一张“每对 rank 走 P2P 还是网卡”的表，表的种类和规则照搬 FlashInfer Cake 的 `cake_transport.py`
+（`deep_gemm/mega/sm120_fp4_transport.py`）。哪些对能走 P2P 由 NCCL 对窗口的映射决定，代码不看拓扑：
+
+| `transport` | 走 P2P 的对 |
+|---|---|
+| `'all_gin'` | 无，所有对端走网卡 |
+| `'all_lsa'` | 全部；NCCL 映射不了某一对就报错 |
+| `'lsa_where_reachable'` | NCCL 能映射的对，其余走网卡 |
+| `'auto'` | 建 buffer 时实测：四张候选表（上面三张 + `lsa_where_faster`：能映射且单对实测 P2P 带宽不低于网卡）在一次满容量调用的字节量下做 all-to-all 打分，混合表要比最好的统一表快 3% 且 3 轮最慢/最快 ≤ 1.5 才选；rank 0 决定后广播 |
+| `'tuned'` | 按部署记录的表（`'auto'` + `DG_SM120_TRANSPORT_RECORD=1` 记录）；没有记录就是 `all_gin` |
+| 显式 `world × world` 元组 | 对角 0，P2P 1，网卡 2，必须对称 |
+
+`'auto'` 的 probe kernel 照搬 Cake（`probe_send`：每个目标一个 CTA，P2P 用 cp.async.bulk 三级流水，网卡用分块 GIN put，
+最后一个 CTA 先做设备侧会合再计时），在 GIN 版扩展里（`probe_round`），用窗口的 pool 区当收件箱、GIN 暂存区当源。
 
 网卡路径（`SM120_FP4_GIN=1` 编译，`Gin::mask` 的位标记哪些对端走网卡）：
 
 - **写法**：数据先写到本 rank 窗口里的暂存区，再由 kernel 里的线程发 NCCL GIN put，写到对方窗口里 P2P 会写的同一偏移。
-- **去程打包**：一个 (token, 专家) 副本的整行（数值 + scale + 元数据 int）一次 put。没有跨 token 合并，没有去重。
+- **去程打包**：发往同一网卡对端的副本行（数值 + scale + 元数据 int）在暂存区按“(对端本地专家, slot)”压缩排好，整个
+  dispatch 结束后由最后一个离开 dispatch 的 CTA 每个对端一次 put，写到对端的接收区（`off_rrow`）；对端 FC1/FC2 读
+  网卡来源的行时按同一压缩下标（`row_ptr`）。每行一次 put 时受网卡消息速率限制（.3 MXFP4 M1024：每行 put 1047 µs，
+  打包 888 µs）。没有去重。
+- **每个对端的副本数**：每个 CTA 开头用整个 CTA 并行数一次（`s_ncopy`），发 put、等回程信号、收尾累加信号总数都读它；
+  原来是单线程在收尾时遍历 T×top-k，.3 上 M1024 收尾就要约 350 µs。
 - **回程打包**：一个 tile 的 FC2 全部完成后（`kCtrTile` 计数），发往同一源 rank 的连续行一次 put。这些行在暂存区按
   “(本地专家, slot)”压缩顺序排列；源 rank 用 `cidx[t][k]` 找到自己的那一行。
 - **信号代替 flag**：每个 put 给接收方的一个信号加上它带的行数（路由计数是 1）。信号按“种类 × 源 rank”编号（`kSigRoute/Rows/Comb + rank`），
@@ -180,12 +195,12 @@ grid = 每 SM 两个 CTA × SM 数（6000D：312 个 CTA）。每个 CTA 256 线
 |---|---|
 | 发往同一 rank 的多个专家副本没有去重（P2P 和网卡都是） | 随机路由下 README 形状约 34% 的发送是重复的。bench 的均衡路由每个 token 的 8 个专家正好分在 8 个 rank，测不出这个问题。改法：每 rank 发一份 + 接收方副本索引表，需要改 pool 布局和 FC1 读行 |
 | RTX PRO 6000 主机（smc521ge-0049，双路 Xeon 8480+）M256 起比 .20 慢 6–26× | 单对 NCCL 带宽正常（44–47 GB/s），P2P 全通。推测是“一张卡的很多 SM 同时写多个远端”时带宽塌，未验证 |
-| `'auto'` 只看 NCCL 能否映射，不看插槽 | 跨插槽 P2P 很慢的主机上会选到慢路，需要“跨插槽走网卡”的规则 |
-| 网卡路径只在单机验证过 | 没有跨机实测 |
+| CX8 主机（.1/.3/.6）上跨根端口的 P2P all-to-all 塌到每卡约 0.7 GB/s | 用传输表绕开：8 个网卡都给 NCCL 时它只映射同插槽的对，`'lsa_where_reachable'` 即“同插槽 P2P、跨插槽网卡”。`'auto'` 的 probe 只搬数据，在 .3 上两张表差 1%，按 3% 规则选了 `all_gin`，而 kernel 实测 `lsa_where_reachable` 每个 M 都更快（W4A4.md） |
+| 跨机只测过 EP16 两台 CX8 主机（.3 + .1） | 三种格式正确性通过，性能见 W4A4.md；Broadcom 主机（.20 类）之间、以及 auto 选表在跨机下的取舍没有测 |
 
 试过、实测没有收益、已从代码删除的做法（不要重复尝试，除非条件变了）：
 
-- 网卡去程“全部量化完后每个目标一次 put”和“按 token 去重逐个 put”：在 .20 上 M2–512 都在 ±2% 以内（注意 bench 路由没有重复副本）。
+- 网卡去程“按 token 去重逐个 put”：在 .20 上 M2–512 都在 ±2% 以内（注意 bench 路由没有重复副本）。
 - 每个 item 24 / 32 个 token；让权重留在 L2 的读法（只在热 L2 下有用，而测法只认冷 L2）。
 
 ## 9. 三种格式
@@ -204,7 +219,7 @@ grid = 每 SM 两个 CTA × SM 数（6000D：312 个 CTA）。每个 CTA 256 线
 
 ```bash
 # 正确性：三种形状（small / readme / wide），每卡最多 128 个 token
-torchrun --nproc-per-node 8 tests/test_mega_moe_sm120_fp4.py verify mxfp4 readme        # 可加 p2p / auto / nic
+torchrun --nproc-per-node 8 tests/test_mega_moe_sm120_fp4.py verify mxfp4 readme        # 可加 p2p / all_gin / all_lsa / lsa_where_reachable / auto / tuned
 # 性能：README 形状，冷 L2，M = 全局 token 数
 torchrun --nproc-per-node 8 tests/test_mega_moe_sm120_fp4.py bench mxfp4 2 4 8 16 64 256 512 1024
 ```

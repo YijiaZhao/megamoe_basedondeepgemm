@@ -14,6 +14,8 @@
 
 import importlib.util
 import os
+import socket
+import sys
 from typing import Optional, Tuple
 
 import torch
@@ -23,9 +25,19 @@ _IMPLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_IMPLS, 'sm120_fp4_mega_moe.cu')
 _GIN_SRC = os.path.join(_IMPLS, 'sm120_fp4_mega_moe_gin.cu')  # NIC transport session (host only)
 FORMATS = {'mxfp4': 32, 'nvfp4': 16, 'w4a8': 32}  # format -> values per block scale
-# 'p2p': every peer over PCIe P2P (cudaIpc). 'auto': the buffer is an NCCL window; the peers NCCL maps for load/store
-# (same host) over P2P, the others (another host) over the NIC with NCCL GIN puts. 'nic': every other rank over GIN.
-TRANSPORTS = ('p2p', 'auto', 'nic')
+# 'p2p': every peer over PCIe P2P (cudaIpc). Otherwise the buffer is one NCCL window and a per-pair transport table
+# (sm120_fp4_transport.py, the rules of FlashInfer's Cake SM120 MegaMoE) says which pairs use P2P stores (LSA) and
+# which NCCL GIN puts through the NIC. Which pairs can use P2P at all is NCCL's peer mapping of the window (e.g. on the
+# CX8 hosts only the GPUs of one CPU socket when NCCL_IB_HCA lists all 8 NICs, every pair with one NIC):
+#   'all_gin': every other rank over GIN. 'all_lsa': every pair over P2P (an error if NCCL cannot map one).
+#   'lsa_where_reachable': P2P where NCCL maps the pair, GIN elsewhere (e.g. another host).
+#   'auto': a setup-time probe times the candidate tables (all_gin, all_lsa, lsa_where_reachable, lsa_where_faster:
+#     P2P where it is mapped and its measured pair bandwidth is at least GIN's) in an all-to-all round of one full
+#     call's bytes and keeps a mixed table only when it beats the best uniform one by 3 %; rank 0 decides.
+#   'tuned': the table recorded for this deployment (DG_SM120_TRANSPORT_TABLES; 'auto' with DG_SM120_TRANSPORT_RECORD=1
+#     records it), all_gin when none is.
+#   Or a tuple of world * world cells (0 SELF on the diagonal, 1 P2P, 2 GIN, symmetric).
+TRANSPORTS = ('p2p', 'all_gin', 'all_lsa', 'lsa_where_reachable', 'auto', 'tuned')
 # NCCL GIN type -> (name, the defines that keep only that backend's device code)
 _GIN_BUILDS = {2: ('proxy', ['-DNCCL_GIN_GDAKI_ENABLE=0', '-DNCCL_GIN_GPI_ENABLE=0']),
                3: ('gdaki', ['-DNCCL_GIN_PROXY_ENABLE=0', '-DNCCL_GIN_GPI_ENABLE=0']),
@@ -73,6 +85,17 @@ def _ext(fmt: str, gin_type: int = 0):
             _EXT[key] = _build(name, _SRC, ['--use_fast_math', f'-DSM120_FP4_NV={int(fmt == "nvfp4")}',
                                             f'-DSM120_FP4_A8={int(fmt == "w4a8")}', *gin], bool(gin_type))
     return _EXT[key]
+
+
+def _transport_module():  # by file path, as the tests load this module
+    if 'transport' not in _EXT:
+        spec = importlib.util.spec_from_file_location(
+            'sm120_fp4_transport', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sm120_fp4_transport.py'))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # its dataclasses look their module up there
+        spec.loader.exec_module(mod)
+        _EXT['transport'] = mod
+    return _EXT['transport']
 
 
 def _gin_session():
@@ -160,13 +183,14 @@ def _clamp(activation_clamp: Optional[float]) -> float:
 
 class Sm120Fp4MegaMoeBuffer:
     """Peer-visible pools (expert inputs, routing, combine) of this rank: one cudaMalloc opened by every peer over
-    cudaIpc ('p2p'), or one NCCL window ('auto' / 'nic', see TRANSPORTS; the group must be a ProcessGroupNCCL).
+    cudaIpc ('p2p'), or one NCCL window with a per-pair transport table (TRANSPORTS; the group must be a
+    ProcessGroupNCCL).
     Collective; build it before CUDA graph capture."""
 
     def __init__(self, group: dist.ProcessGroup, fmt: str, num_experts: int, num_max_tokens_per_rank: int,
                  num_topk: int, hidden: int, intermediate_hidden: int, transport: str = 'p2p'):
         assert fmt in FORMATS, fmt
-        assert transport in TRANSPORTS, transport
+        assert transport in TRANSPORTS or isinstance(transport, (tuple, list)), transport
         self.group, self.fmt = group, fmt
         self.rank, self.world = group.rank(), group.size()
         assert num_experts % self.world == 0
@@ -176,7 +200,8 @@ class Sm120Fp4MegaMoeBuffer:
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
-        self.transport = 'p2p' if self.world == 1 else transport
+        self.transport = 'p2p' if self.world == 1 else (tuple(transport) if isinstance(transport, list) else transport)
+        self.transport_table, self.transport_report, self.gin_mask = None, None, 0
         key = (self.rank, self.world, self.num_local_experts, num_max_tokens_per_rank, hidden, intermediate_hidden,
                num_topk)
         if fmt not in _KEY:
@@ -193,8 +218,8 @@ class Sm120Fp4MegaMoeBuffer:
         self.ext = _KEY[fmt][1]
 
     def _init_window(self, key):
-        """The buffer as one NCCL symmetric window: P2P to the peers NCCL maps for load/store ('auto'), NCCL GIN
-        through the NIC to the others, or to every other rank ('nic')."""
+        """The buffer as one NCCL symmetric window; the transport table (TRANSPORTS) gives each pair P2P or GIN."""
+        T = _transport_module()
         group, rank, world = self.group, self.rank, self.world
         dist.barrier(group=group)  # ProcessGroupNCCL creates its communicator lazily
         backend = group._get_backend(torch.device('cuda'))
@@ -206,29 +231,61 @@ class Sm120Fp4MegaMoeBuffer:
         handle = session.create(comm, rank, world, int(_ext(self.fmt).window_bytes(*key)), _GIN_CONTEXTS)
         base, win, dev_comm, contexts = (int(v) for v in session.info(handle))
         peers = [int(p) for p in session.peers(handle)]
-        mask = 0
-        for w in range(world):
-            if w != rank and (self.transport == 'nic' or peers[w] == 0):
-                mask |= 1 << w
-        masks = [None] * world  # a pair sends and receives over the same transport: the masks must agree
-        dist.all_gather_object(masks, mask, group=group)
-        for w in range(world):
-            if (mask >> w & 1) != (masks[w] >> rank & 1):
-                raise RuntimeError(f'ranks {rank} and {w} disagree on the transport between them')
-        if mask and (dev_comm == 0 or gin_type not in _GIN_BUILDS):
-            raise RuntimeError(f'ranks {[w for w in range(world) if mask >> w & 1]} need the NIC, but the NCCL '
-                               f'communicator offers no supported GIN (type {gin_type})')
+        gin_ok = dev_comm != 0 and gin_type in _GIN_BUILDS
+        pair_ok = T.gather_lsa_pair_matrix([p != 0 for p in peers], group)
+        spec, report = self.transport, None
+        if spec == 'auto':
+            feasible = T.build_candidates(world, pair_ok, gin_ok, {}, {})
+            if gin_ok and len(feasible) > 1:  # the probe runs on the GIN build
+                probe_ext = _ext(self.fmt, gin_type)
+                probe_ext.window_bytes(*key)
+                token_row = self.hidden // (1 if self.fmt == 'w4a8' else 2) + self.hidden // FORMATS[self.fmt] + 16
+                table, report = T.select_transport_table(
+                    probe_ext, group=group, rank=rank, world=world, comm=dev_comm, win=win, base=base, peers=peers,
+                    lsa_reachable=[p != 0 for p in peers], gin_available=gin_ok,
+                    traffic=T.probe_traffic(world=world, rows=self.num_max_tokens_per_rank, top_k=self.num_topk,
+                                            hidden=self.hidden, token_row_bytes=token_row),
+                    report_path=os.environ.get('DG_SM120_TRANSPORT_REPORT'))
+                if os.environ.get('DG_SM120_TRANSPORT_RECORD') == '1' and rank == 0:
+                    T.record_tuned(self._deployment_key(T, pair_ok, gin_ok), table, report)
+            else:
+                table = feasible[0]
+        elif spec == 'tuned':
+            key_ = self._deployment_key(T, pair_ok, gin_ok)
+            payload = [T.lookup_tuned(key_) if rank == 0 else None]
+            dist.broadcast_object_list(payload, src=dist.get_global_rank(group, 0), group=group)
+            cells = None if payload[0] is None else payload[0].get('transport_table')
+            table = T.uniform_table(world, T.TRANSPORT_GIN) if cells is None else \
+                T.TransportTable(world, tuple(int(c) for c in cells), f"tuned:{payload[0].get('table_name')}")
+        elif spec == 'all_gin':
+            table = T.uniform_table(world, T.TRANSPORT_GIN)
+        elif spec == 'all_lsa':
+            table = T.uniform_table(world, T.TRANSPORT_LSA)
+        elif spec == 'lsa_where_reachable':
+            table = T.lsa_where_reachable(world, pair_ok)
+        else:
+            table = T.TransportTable(world, tuple(int(c) for c in spec), 'override')
+        T.validate_table(table, pair_ok, gin_ok)
+        row = table.row(rank)
+        mask = sum(1 << w for w in range(world) if w != rank and row[w] == T.TRANSPORT_GIN)
         ext = _ext(self.fmt, gin_type if mask else 0)  # without GIN peers the build without the GIN code (faster)
         ext.init_window(*key, base, [0 if mask >> w & 1 else peers[w] for w in range(world)], mask, dev_comm, win,
                         contexts)
-        self.gin_mask = mask
+        self.gin_mask, self.transport_table, self.transport_report = mask, table, report
         self._session = (session, handle)
         dist.barrier(group=group)
         return ext
 
+    def _deployment_key(self, T, pair_ok, gin_ok):
+        hosts = [None] * self.world
+        dist.all_gather_object(hosts, socket.gethostname(), group=self.group)
+        return {'fmt': self.fmt, 'world': self.world, 'hidden': self.hidden, 'intermediate': self.intermediate_hidden,
+                'experts': self.num_experts, 'topk': self.num_topk, 'max_tokens': self.num_max_tokens_per_rank,
+                'topology': T.topology_digest(pair_ok, gin_ok, hosts)}
+
     def destroy(self) -> None:
-        """Collective: release the NCCL window ('auto' / 'nic') before the process group is destroyed. The buffer of
-        this format is unusable afterwards."""
+        """Collective: release the NCCL window (every transport but 'p2p') before the process group is destroyed. The
+        buffer of this format is unusable afterwards."""
         session = getattr(self, '_session', None)
         if session is not None:
             torch.cuda.synchronize()

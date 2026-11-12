@@ -14,7 +14,7 @@
 
 namespace {
 
-constexpr int kGinSignals = 48;  // sm120_fp4_mega_moe.cu: 3 * kMaxWorld
+constexpr int kGinSignals = 80;  // sm120_fp4_mega_moe.cu: 3 * kMaxWorld kernel signals + 2 * kMaxWorld probe signals
 
 void check_nccl(ncclResult_t rc, const char *what) {
     TORCH_CHECK(rc == ncclSuccess, what, " failed: ", ncclGetErrorString(rc));
