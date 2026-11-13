@@ -32,4 +32,4 @@ docker rm -f "$NAME" > /dev/null 2>&1 || true
 docker run --rm --name "$NAME" -u root --network host \
   -v "$CLIENT_DIR":/client -v "$(dirname "$DATA")":/data:ro --entrypoint bash lmsysorg/sglang:v0.5.22-cu130 \
   -c "cd /client && bash run.sh --config config_dsv41_dp8.json $BS" 2>&1 | tee "$CLIENT_DIR/bench_bs$BS.log" \
-  | grep -E "BS/rank=|ERROR|SSE gap|Output TPS|Speculative lifetime|cache hit"
+  | grep -E "BS/rank=|ERROR|SSE gap|Output TPS|Speculative lifetime|Formal input cache hit"
