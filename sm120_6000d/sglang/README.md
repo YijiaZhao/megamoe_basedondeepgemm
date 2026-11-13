@@ -31,7 +31,7 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 ## 一步步跑
 
 ```bash
-git clone -b sglang-dsv41-0522 https://github.com/YijiaZhao/megamoe_basedondeepgemm.git
+git clone https://github.com/YijiaZhao/megamoe_basedondeepgemm.git
 cd megamoe_basedondeepgemm/sm120_6000d/sglang
 docker pull lmsysorg/sglang:v0.5.22-cu130
 MODEL_DIR=/raid/models bash launch.sh            # 容器名 dsv41_sglang；CX8aaS 机型加 TRANSPORT=auto
