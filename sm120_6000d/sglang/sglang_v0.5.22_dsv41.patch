@@ -1,0 +1,285 @@
+diff -ruN a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
+--- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
++++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
+@@ -43,7 +43,7 @@
+ def is_sm100_or_newer() -> bool:
+     # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
+     # take the torch indexer.
+-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
++    return is_cuda() and torch.cuda.get_device_capability()[0] == 10  # SM120 lacks the SM100 DeepGEMM indexer kernels
+ 
+ 
+ @functools.cache
+diff -ruN a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
+--- a/python/sglang/srt/layers/moe/mega_moe.py
++++ b/python/sglang/srt/layers/moe/mega_moe.py
+@@ -163,6 +163,8 @@
+         return False
+     if _device_sm == 90:
+         return is_sm90_fp8_mega_moe_available(experts)
++    if _device_sm == 120:
++        return True
+     # The SM100 mega kernels exist for compute capability 10.x only.
+     return _device_sm // 10 == 10
+ 
+@@ -338,6 +340,25 @@
+     from sglang.srt.runtime_context import get_parallel
+ 
+     ep_group = get_parallel().moe_ep_group.device_group
++    if _device_sm == 120:
++        from sglang.srt.layers.moe.mega_moe_sm120 import run_sm120_mega_routed
++
++        if num_tokens == 0:
++            topk_ids = hidden_states.new_empty((0, top_k), dtype=torch.int32)
++            topk_weights = hidden_states.new_empty((0, top_k), dtype=torch.float32)
++        return run_sm120_mega_routed(
++            experts,
++            hidden_states,
++            topk_ids,
++            topk_weights,
++            ep_group,
++            num_tokens,
++            hidden_size=hidden_size,
++            intermediate_size=intermediate_size,
++            top_k=top_k,
++            activation_clamp=activation_clamp,
++            routed_scaling_factor=routed_scaling_factor,
++        )
+     num_experts = experts.num_experts
+     num_max_tokens_per_rank = (
+         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/layers/moe/mega_moe_sm120.py
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/mega_moe_sm120.py
+@@ -0,0 +1,195 @@
++# Copyright 2023-2024 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""SM120 (RTX PRO 6000 / 6000D) Mega-MoE for decode: MXFP4 experts x MXFP8 activations.
++
++With SGLANG_SM120_MEGA_MOE=1 and SGLANG_SHARED_EXPERT_TP1=1, attention DP and MoE EP over the FlashInfer CUTLASS
++MXFP4 backend (--moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4), a
++MoE call whose largest per-rank token count is at most
++SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK runs `fp4_mega_moe_sm120`
++(megamoe_basedondeepgemm, format 'w4a8_rm') on this rank's tokens: one persistent
++kernel that quantizes them, pushes them over PCIe P2P to the experts' ranks, runs
++FC1 + SwiGLU + FC2 there and combines the partials back here. Larger calls take
++the configured path. The kernel reads the FP4 weights FlashInfer holds (the
++checkpoint's row-major layout) and keeps its own copy of the UE8M0 scales. The
++module `deep_gemm/mega/sm120_fp4.py` is loaded by path from
++SGLANG_SM120_MEGA_MOE_DIR (a megamoe_basedondeepgemm checkout); its torch
++extension builds on first use.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import logging
++import os
++from typing import Optional
++
++import torch
++
++from sglang.srt.environ import envs
++
++logger = logging.getLogger(__name__)
++
++_FMT = "w4a8_rm"
++_LOGGED = set()
++_SHAPE = None  # (experts, top-k) of the first layer built: the kernel holds one buffer per process
++_MODULE = None
++_BUFFER: dict = {}
++
++
++def sm120_mega_moe_enabled() -> bool:
++    return os.environ.get("SGLANG_SM120_MEGA_MOE", "0") == "1"
++
++
++def sm120_fp4():
++    global _MODULE
++    if _MODULE is None:
++        root = os.environ.get("SGLANG_SM120_MEGA_MOE_DIR", "/opt/sm120_megamoe")
++        path = os.path.join(root, "deep_gemm", "mega", "sm120_fp4.py")
++        spec = importlib.util.spec_from_file_location("sm120_fp4", path)
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        _MODULE = module
++    return _MODULE
++
++
++def _max_tokens_per_rank() -> int:
++    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
++
++
++def use_sm120_mega_moe(moe, hidden_states: torch.Tensor) -> bool:
++    """Rank-uniform: every rank sees the same per-rank token counts (or, in CUDA graph capture, the same padded
++    batch)."""
++    if not sm120_mega_moe_enabled() or not getattr(moe.experts, "_mega_moe_weights_built", False):
++        return False
++    if getattr(moe, "num_fused_shared_experts", 0) != 0:  # the kernel routes only the routed experts
++        return False
++    # the shared expert runs on this rank's tokens only: it must be whole here (SGLANG_SHARED_EXPERT_TP1=1), not a TP
++    # shard summed over the ranks
++    if getattr(moe, "shared_experts", None) is not None and not getattr(moe, "_shared_expert_tp1", False):
++        return False
++    from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
++    from sglang.srt.model_executor.runner import get_is_capture_mode
++
++    if get_is_capture_mode():
++        use = hidden_states.shape[0] <= _max_tokens_per_rank()
++    else:
++        global_num_tokens = get_dp_global_num_tokens()
++        use = bool(global_num_tokens) and max(global_num_tokens) <= _max_tokens_per_rank()
++    if use not in _LOGGED:  # once per process and path
++        _LOGGED.add(use)
++        logger.info("SM120 MegaMoE: first call on the %s path (%d local tokens)",
++                    "mega kernel" if use else "configured MoE", hidden_states.shape[0])
++    return use
++
++
++def _ue8m0_bytes(scale: torch.Tensor) -> torch.Tensor:
++    # SGLang keeps the UE8M0 block scales as e8m0 bytes, or as fp32 powers of two
++    if scale.dtype == torch.float32:
++        return ((scale.view(torch.int32) >> 23) & 0xFF).to(torch.uint8)
++    assert scale.element_size() == 1, scale.dtype
++    return scale.view(torch.uint8)
++
++
++def build_sm120_mega_moe_scales(experts, w13_up_first: bool) -> None:
++    """At load, from the checkpoint's scales (before another backend rearranges them): the kernel's scale copy.
++    `w13_up_first`: W13 holds the up rows first (FlashInfer CUTLASS loads it that way)."""
++    global _SHAPE
++    if getattr(experts, "_mega_moe_weights_built", False):
++        return
++    shape = (experts.num_experts, experts.top_k)
++    if _SHAPE is None:
++        _SHAPE = shape
++    elif shape != _SHAPE:  # e.g. a draft model's MoE: it keeps the configured path
++        logger.info("SM120 MegaMoE: %s experts / top-%d stays on the configured MoE (mega kernel: %s)",
++                    shape[0], shape[1], _SHAPE)
++        return
++    fp4 = sm120_fp4()
++    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
++    s13 = _ue8m0_bytes(experts.w13_weight_scale_inv.data)
++    s2 = _ue8m0_bytes(experts.w2_weight_scale_inv.data)
++    (_, ws13), (_, ws2) = fp4.transform_fp4_weights_for_mega_moe_sm120(
++        (w13.view(torch.uint8), s13), (w2.view(torch.uint8), s2), _FMT, w13_up_first
++    )
++    experts.mega_sm120_scales = (ws13, ws2)
++    experts.mega_sm120_up_first = w13_up_first
++    experts._mega_moe_weights_built = True
++
++
++def _get_buffer(group, num_experts, num_max_tokens_per_rank, top_k, hidden, inter):
++    key = (id(group), num_experts, num_max_tokens_per_rank, top_k, hidden, inter)
++    buf = _BUFFER.get(key)
++    if buf is None:
++        # the kernel's work-item table holds EL + W * TCAP * top-k / 8 tiles (kMaxTiles)
++        world = group.size()
++        cap = (2304 - num_experts // world) * 8 // (world * top_k)
++        if num_max_tokens_per_rank > cap:
++            raise ValueError(
++                f"SM120 MegaMoE supports at most {cap} tokens per rank here "
++                f"(EP{world}, {num_experts} experts, top-{top_k}); set "
++                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at most "
++                f"{cap} (now {num_max_tokens_per_rank})."
++            )
++        # p2p (default) or auto / nic (NCCL GIN over the NICs for peers P2P serves badly, e.g. CX8aaS hosts)
++        transport = os.environ.get("SGLANG_SM120_MEGA_MOE_TRANSPORT", "p2p")
++        logger.info("SM120 MegaMoE buffer: EP%d, transport %s", world, transport)
++        buf = sm120_fp4().Sm120Fp4MegaMoeBuffer(
++            group, _FMT, num_experts, num_max_tokens_per_rank, top_k, hidden, inter, transport=transport
++        )
++        _BUFFER[key] = buf
++    return buf
++
++
++def run_sm120_mega_routed(
++    experts,
++    hidden_states: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    ep_group,
++    num_tokens: int,
++    *,
++    hidden_size: int,
++    intermediate_size: int,
++    top_k: int,
++    activation_clamp: Optional[float],
++    routed_scaling_factor: float,
++) -> torch.Tensor:
++    buf = _get_buffer(
++        ep_group,
++        experts.num_experts,
++        _max_tokens_per_rank(),
++        top_k,
++        hidden_size,
++        intermediate_size,
++    )
++    y = torch.empty(
++        (max(num_tokens, 1), hidden_size),
++        dtype=torch.bfloat16,
++        device=hidden_states.device,
++    )
++    ws13, ws2 = experts.mega_sm120_scales
++    sm120_fp4().fp4_mega_moe_sm120(
++        y[:num_tokens],
++        hidden_states[:num_tokens],
++        topk_ids,
++        topk_weights,
++        (experts.w13_weight.data, ws13),
++        (experts.w2_weight.data, ws2),
++        buf,
++        activation_clamp=activation_clamp,
++        w13_up_first=experts.mega_sm120_up_first,
++    )
++    y = y[:num_tokens]
++    if routed_scaling_factor != 1.0:
++        y.mul_(routed_scaling_factor)
++    return y
+diff -ruN a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+--- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
++++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+@@ -153,6 +153,13 @@
+         w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8)
+ 
+         if self._use_mxfp8_act_scaling:
++            from sglang.srt.layers.moe.mega_moe_sm120 import (
++                build_sm120_mega_moe_scales,
++                sm120_mega_moe_enabled,
++            )
++
++            if sm120_mega_moe_enabled():
++                build_sm120_mega_moe_scales(layer, self.load_up_proj_weight_first)
+             from flashinfer import block_scale_interleave
+ 
+             if (
+diff -ruN a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -3431,6 +3431,15 @@
+         return_moe_output: bool = False,
+     ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
+         _use_cp = is_cp_active(forward_batch)
++        from sglang.srt.layers.moe.mega_moe_sm120 import use_sm120_mega_moe
++
++        if not _use_cp and use_sm120_mega_moe(self.mlp, hidden_states):
++            from sglang.srt.layers.moe.mega_moe import forward_mega_moe
++
++            # hash-routed layers take this rank's token ids
++            return forward_mega_moe(
++                self.mlp, hidden_states, forward_batch, input_ids_global=input_ids
++            )
+         _use_tp_moe_gather = (
+             not _use_cp
+             and get_parallel().attn_dp_size > 1
