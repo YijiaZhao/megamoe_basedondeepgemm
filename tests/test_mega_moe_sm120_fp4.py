@@ -111,6 +111,8 @@ SHAPES = {  # hidden, intermediate, experts, top-k
     'small': (512, 256, 128, 6),
     'readme': (3072, 1280, 384, 8),  # the README's validated shape (48 local experts at EP8)
     'wide': (5120, 256, 128, 6),
+    'dsv41': (5120, 2304, 384, 6),  # DeepSeek-V4.1-Flash routed experts
+    'dsv41_eplb16': (5120, 2304, 400, 6),  # DeepSeek-V4.1-Flash with 16 redundant experts (EPLB)
 }
 
 
@@ -267,6 +269,70 @@ def bench(fmt, rank, world, group, ms, transport, stamps=False):
     buf.destroy()
 
 
+def stress(fmt, rank, world, group, transport, shape='dsv41_eplb16', n=300, sparse=False, hog=False):
+    """Back-to-back eager calls with no sync between them and a random per-rank delay before each (the ranks drift
+    apart as in a model's forward), against the same inputs run one at a time behind a barrier. sparse: each rank sends
+    to the experts of 2 ranks only, so a rank can finish a call without waiting for the ranks it sent nothing; hog:
+    another stream's GEMM holds the SMs while a call starts, so some of its CTAs start late."""
+    gen = torch.Generator(device='cuda').manual_seed(11 + rank)
+    slots = []
+    h, i, e, topk = SHAPES[shape]
+    el = e // world
+    l1, l2, gs = kernel_inputs(fmt, [expert_codes(rank * el + j, h, i, fmt) for j in range(el)])
+    b = fp4.Sm120Fp4MegaMoeBuffer(group, fmt, e, 128, topk, h, i, transport)
+    show_transport(b)
+    slots.append((b, l1, l2, gs, e, topk, h))
+    inputs = []  # (slot, x, ids, wts)
+    for k in range(8):
+        sl = k % len(slots)
+        b, l1, l2, gs, e, topk, h = slots[sl]
+        t = (96, 80, 42, 80, 96, 30, 72, 80)[k]
+        ids, wts = routing(t, e, topk, 1000 * k + rank)
+        if sparse:  # this rank sends only to the experts of 2 ranks (the others get nothing from it this call)
+            el = e // world
+            dst = torch.tensor([(rank + k) % world, (rank + 3 * k + 1) % world], device='cuda')
+            pick = torch.rand(t, 2 * el, device='cuda', generator=gen).argsort(-1)[:, :topk]  # distinct per token
+            ids = (dst[pick // el] * el + pick % el).int()
+        x = (torch.randn(t, h, device='cuda', generator=gen) * 0.1).bfloat16()
+        inputs.append((sl, x, ids, wts))
+
+    def run(k):
+        sl, x, ids, wts = inputs[k]
+        b, l1, l2, gs = slots[sl][:4]
+        y = torch.empty_like(x)
+        fp4.fp4_mega_moe_sm120(y, x, ids, wts, l1, l2, b, gs, activation_clamp=LIMIT)
+        return y
+
+    refs = []
+    for k in range(len(inputs)):
+        dist.barrier()
+        refs.append(run(k))
+        torch.cuda.synchronize()
+    rng = torch.Generator().manual_seed(77 + rank)
+    side = torch.cuda.Stream()
+    hog_a = torch.randn(8192, 8192, device='cuda', dtype=torch.bfloat16)
+    outs = []
+    for j in range(n):
+        torch.cuda._sleep(int(torch.randint(0, 3_000_000, (1,), generator=rng)))  # up to ~2 ms on this rank only
+        if hog and torch.rand(1, generator=rng).item() < 0.5:
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                hog_a @ hog_a
+        outs.append((j % len(inputs), run(j % len(inputs))))
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    bad = sum(int(((y.float() - refs[k].float()).norm() / refs[k].float().norm().clamp_min(1e-6)).item() > 1e-2)
+              for k, y in outs)
+    res = torch.tensor([bad, sum(s[0].error() for s in slots)], device='cuda')
+    dist.all_reduce(res)
+    if rank == 0:
+        print(f'{fmt} {shape}{" sparse" if sparse else ""}{" hog" if hog else ""} EP{world} stress {n} calls: '
+              f'mismatching outputs (all ranks) {res[0].item()}, error words {res[1].item()}',
+              'PASS' if res.sum().item() == 0 else 'FAIL', flush=True)
+    for s in slots:
+        s[0].destroy()
+
+
 def main():
     mode, fmt, args = sys.argv[1], sys.argv[2], sys.argv[3:]
     transport = next((a for a in args if a in fp4.TRANSPORTS), 'p2p')
@@ -281,7 +347,10 @@ def main():
     if rank == 0:  # build once before the other ranks load it
         fp4._ext(fmt)
     dist.barrier()
-    if mode == 'verify':
+    if mode == 'stress':
+        stress(fmt, rank, world, dist.group.WORLD, transport, next((a for a in args if a in SHAPES), 'dsv41_eplb16'),
+               sparse='sparse' in args, hog='hog' in args)
+    elif mode == 'verify':
         verify(fmt, args[0] if args else 'small', rank, world, dist.group.WORLD, transport)
     else:
         bench(fmt, rank, world, dist.group.WORLD, [int(a) for a in args] or [2, 4, 8, 16, 64, 256, 512, 1024], transport,

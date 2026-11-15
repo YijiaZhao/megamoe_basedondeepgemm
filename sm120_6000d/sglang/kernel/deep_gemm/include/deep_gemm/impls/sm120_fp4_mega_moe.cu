@@ -117,7 +117,7 @@ struct Peers {
     int *recv_flag[kMaxWorld];      // [W] epoch
     __nv_bfloat16 *comb[kMaxWorld]; // [TCAP][TOPK][H]                    (src-owned)
     int *comb_flag[kMaxWorld];      // [W] epoch
-    int *route[kMaxWorld];          // [W][EL]: tokens each source rank sends to each expert (dest-owned)
+    int *route[kMaxWorld];          // [2][W][EL]: tokens each source rank sends to each expert, by epoch parity (dest-owned)
     int *route_flag[kMaxWorld];     // [W] epoch
 };
 
@@ -129,7 +129,7 @@ struct Gin {
     uint32_t mask;     // bit w: rank w is reached with GIN puts
     int nctx;          // GIN contexts: CTA b posts on context b % nctx; a signal is the sum over them
     size_t off_pool, off_route, off_rcomb, st_route, st_row, st_comb, off_rrow;
-    int *s_route;           // [W][EL] this rank's token counts for each GIN peer's experts
+    int *s_route;           // [2][W][EL] this rank's token counts for each GIN peer's experts, by epoch parity
     uint8_t *s_row;         // [W][TCAP*TOPK] pool rows of the copies to each GIN peer, packed (its local expert, slot)
     const uint8_t *r_row;   // [W][TCAP*TOPK] pool rows from each GIN source, packed the same way
     __nv_bfloat16 *s_comb;  // [W][TCAP*TOPK][H] partials for each GIN source, packed (local expert, slot)
@@ -638,9 +638,13 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
             if (e >= 0) atomicAdd(&m.cnt[e / EL][e % EL], 1);
         }
         __syncthreads();
+        // the counts go to the half of the peer's route region this call's epoch parity picks: a peer that sends this
+        // rank nothing need not wait for it, finishes the call and posts its next call's counts while this rank may not
+        // have read these yet (it cannot get two calls ahead: the next call waits for every rank's counts)
+        const int rhalf = (epoch & 1) * W * EL;
         for (int u = threadIdx.x; u < W * EL; u += blockDim.x) {
             const int d = u / EL;
-            *(is_gin(a, d) ? a.gin.s_route + u : a.peers.route[d] + a.rank * EL + u % EL) = m.cnt[d][u % EL];
+            *(is_gin(a, d) ? a.gin.s_route + rhalf + u : a.peers.route[d] + rhalf + a.rank * EL + u % EL) = m.cnt[d][u % EL];
         }
         __threadfence_system();
         __syncthreads();
@@ -648,8 +652,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
             const int d = threadIdx.x;
 #if SM120_FP4_GIN_DEVICE
             if (is_gin(a, d))
-                gin_put(a, d, a.gin.off_route + size_t(a.rank) * EL * 4, a.gin.st_route + size_t(d) * EL * 4, EL * 4,
-                        kSigRoute + a.rank, 1);
+                gin_put(a, d, a.gin.off_route + (size_t(rhalf) + size_t(a.rank) * EL) * 4,
+                        a.gin.st_route + (size_t(rhalf) + size_t(d) * EL) * 4, EL * 4, kSigRoute + a.rank, 1);
             else
 #endif
                 st_release_sys(a.peers.route_flag[d] + a.rank, epoch);
@@ -797,7 +801,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     __syncthreads();
     st_[9] = gtime();
     if (!s_ok) goto exit_kernel;
-    for (int u = threadIdx.x; u < W * EL; u += blockDim.x) m.cnt[u / EL][u % EL] = __ldcv(a.peers.route[a.rank] + u);
+    for (int u = threadIdx.x; u < W * EL; u += blockDim.x)
+        m.cnt[u / EL][u % EL] = __ldcv(a.peers.route[a.rank] + (epoch & 1) * W * EL + u);
     __syncthreads();
     if (warp == 0) {
         int tiles_sum = 0, tiles_max = 0;
@@ -1395,11 +1400,11 @@ static void layout(int rank, int world, int EL, int TCAP, int H, int I, int TOPK
     g.off_rflag = o; o = align_up(o + size_t(world) * 4);
     g.off_comb = o; o = align_up(o + size_t(TCAP) * TOPK * H * 2);
     g.off_cflag = o; o = align_up(o + size_t(world) * 4);
-    g.off_route = o; o = align_up(o + size_t(world) * EL * 4);
+    g.off_route = o; o = align_up(o + 2 * size_t(world) * EL * 4);  // two halves, by epoch parity
     g.off_rtflag = o; o = align_up(o + size_t(world) * 4);
     if (window) {
         TORCH_CHECK(EL + world * TCAP * TOPK / kTile <= kMaxTiles, "the NIC transport takes at most 64 tokens per rank");
-        g.st_route = o; o = align_up(o + size_t(world) * EL * 4);
+        g.st_route = o; o = align_up(o + 2 * size_t(world) * EL * 4);
         g.st_row = o; o = align_up(o + size_t(world) * TCAP * TOPK * pool_rx(H));
         g.st_comb = o; o = align_up(o + size_t(world) * TCAP * TOPK * H * 2);
         g.off_rcomb = o; o = align_up(o + size_t(world) * TCAP * TOPK * H * 2);

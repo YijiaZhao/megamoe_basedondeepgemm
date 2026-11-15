@@ -8,7 +8,7 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 
 | `kernel/` 下的文件 | 相对仓库同名文件的改动 |
 |---|---|
-| `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变 |
+| `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变；路由计数按 epoch 奇偶双缓冲（与仓库主 kernel 相同） |
 | `deep_gemm/mega/sm120_fp4.py` | `FORMATS` 加 `w4a8_rm`；权重转换对 `w4a8_rm` 只重排 scale、权重原样返回；`w13_up_first` 参数；缓冲区参数 `slot`：扩展的状态是静态的，一个进程里每多一种 MoE 形状就占一个 slot，各加载一份扩展（`_s1` 后缀），主模型用 slot 0、DSPARK draft 模型用 slot 1 |
 | `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe_gin.cu`、`deep_gemm/mega/sm120_fp4_transport.py` | 无改动（`sm120_fp4.py` 按相对路径找它们，一起拷过来）|
 | `tests/test_mega_moe_sm120_fp4.py` | `w4a8_rm` 额外测 `up_first=True`：`torchrun --nproc_per_node=8 kernel/tests/test_mega_moe_sm120_fp4.py verify w4a8_rm`；形状 `dsv41` / `dsv41_draft`；`two_slots w4a8_rm`：主模型和 draft 两种形状在一个进程的 slot 0 / 1 上，直接跑和 CUDA graph 里各跑一遍 |
