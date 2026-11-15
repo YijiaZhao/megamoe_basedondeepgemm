@@ -34,7 +34,7 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 git clone https://github.com/YijiaZhao/megamoe_basedondeepgemm.git
 cd megamoe_basedondeepgemm/sm120_6000d/sglang
 docker pull lmsysorg/sglang:v0.5.22-cu130
-MODEL_DIR=/raid/models bash launch.sh            # 容器名 dsv41_sglang；CX8aaS 机型加 TRANSPORT=lsa_where_reachable
+MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # 最快的配置（CX8aaS 机型，EPLB）；容器名 dsv41_sglang
 docker logs -f dsv41_sglang                      # 等到 "The server is fired up"（约 7 分钟，第一次含 kernel 编译）
 curl -s localhost:30041/generate -H 'Content-Type: application/json' \
   -d '{"text":"1+1=","sampling_params":{"max_new_tokens":8,"temperature":0}}'
@@ -55,6 +55,9 @@ docker rm -f dsv41_sglang                        # 停掉
 | `layers/moe/mega_moe.py` | SM120 分支：`is_mega_moe_experts_ready` 认 SM120；`run_mega_routed_experts` 在 SM120 上调 `run_sm120_mega_routed` |
 | `layers/moe/mega_moe_sm120.py`（新文件）| 是否走 kernel（每个 rank 一次调用的 token 数 ≤ 128，所有 DP rank 统一判断；CUDA graph 按 capture 的批大小）、建缓冲区（每种 MoE 形状一个 slot：主模型 384 专家 top-6 是 slot 0，DSPARK draft 模型 128 专家 top-3 是 slot 1）、选传输方式、调 kernel |
 | `layers/quantization/mxfp4_flashinfer_cutlass_moe.py` | 加载权重时给 kernel 生成一份 UE8M0 scale；FP4 权重和 FlashInfer 共用一份 |
+| `multimodal/dsv41/vl_routing.py` | EPLB：DSV4.1 的 router 走 `vision_topk`，上游只在 MegaMoE a2a 后端时把逻辑专家号换成物理专家号；`--moe-a2a-backend none` 时也换（不换则 gsm8k 掉到 0.02）|
+| `models/deepseek_v2.py` | EPLB：冗余专家只加给主模型，DSPARK draft（128 专家）不加；`vision_topk` 传 `expert_location_dispatch_info` |
+| `layers/moe/fused_moe_triton/layer.py` | EPLB：draft 模型的 MoE 加载权重时不用主模型的专家放置 |
 
 router（gate + topk）用 SGLang 自己的，结果传给 kernel。主模型和 DSPARK draft 模型的 routed experts 都走 kernel，draft 也不再做 DP gather / scatter。
 不走 kernel 的部分：prefill / chunked prefill（任一 rank 超过 128 token）、shared expert、attention。
@@ -65,7 +68,13 @@ router（gate + topk）用 SGLang 自己的，结果传给 kernel。主模型和
 MODEL_DIR=/raid/models bash launch.sh                  # MegaMoE，卡间全走 PCIe P2P
 MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable bash launch.sh   # MegaMoE，NCCL 映射不了 P2P 的卡间走网卡（CX8aaS）
 MODEL_DIR=/raid/models MEGA=0 bash launch.sh           # 基线：原版 FlashInfer MoE（只带启动修复）
+MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # 再开 EPLB（8 个冗余专家），最快；MEGA=0 也能加
 ```
+
+**EPLB**（`EPLB=1`）：`--init-expert-location eplb_map_r8_ep8.pt --ep-num-redundant-experts 8`。主模型 384 个专家加 8 个副本，
+每卡 49 个，热门专家复制、按负载摊到 8 张卡；draft 模型不动。`eplb_map_r8_ep8.pt` 是 `{'physical_to_logical_map': [40 层, 392]}`：
+在同一个 decode bench（pg19，每 rank BS16、输入 100K）上统计主模型每层每个专家的 token 数，用 SGLang 的
+`eplb_algorithms.rebalance_experts`（`auto`，单机，8 卡）算出来。换负载或卡数要另算一份，用 `EPLB_MAP=<文件> REDUNDANT=<副本数>` 传入。
 
 `launch.sh` 把 `kernel/` 挂成 kernel 源码（`/opt/sm120_megamoe`），kernel 第一次调用时按 `sm_120a` 编译，缓存在 `BUILD_DIR`。
 服务端参数和下面性能表用的一致，写在脚本里；多余参数追加到命令末尾。
@@ -120,9 +129,10 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 | 机器 | 传输 | 基线 TPOT P50 / 平均 / P95 (ms) | MegaMoE TPOT P50 / 平均 / P95 (ms) | TPOT 平均 | 全机输出 tok/s（基线 → MegaMoE）|
 |---|---|---|---|---|---|
 | .6（CX8aaS）| `lsa_where_reachable` + 8 网卡 | 58.5 / 57.6 / 75.5 | 48.2 / 48.1 / 65.1 | −16.5% | 2332 → 2745 |
+| .6（CX8aaS），EPLB 8 个冗余专家 | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **44.3 / 45.6 / 60.6** | −18.7% | 2589 → **3032** |
 | .20（Broadcom）¹ | `p2p` | — / 57.3 / 80.2 | — / 48.8 / 64.7 | −14.8% | 2217 → 2818 |
 
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
 
-精度：gsm8k（1319 题）基线 0.907（128 并发）；MegaMoE（主模型 + draft，.6）0.900。
+精度：gsm8k（1319 题，128 并发）基线 0.907，MegaMoE（主模型 + draft，.6）0.900；开 EPLB：基线 0.917，MegaMoE 0.918。
 逐层对比（同一输入，kernel 对 FlashInfer）：相对误差中位数 1.4%，余弦相似度 ≥ 0.9997。

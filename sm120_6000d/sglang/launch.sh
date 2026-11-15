@@ -6,8 +6,11 @@
 #   MODEL_DIR=/raid/models bash launch.sh                  # MegaMoE, PCIe P2P (Broadcom-switch hosts, e.g. .20)
 #   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable bash launch.sh   # MegaMoE, peers NCCL cannot map for P2P over the NICs (CX8aaS)
 #   MODEL_DIR=/raid/models MEGA=0 bash launch.sh           # baseline: stock FlashInfer MoE (startup fix only)
+#   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # + EPLB, 8 redundant experts (fastest)
 # Environment: MODEL_DIR (host dir holding the model), MODEL (dir name, default DeepSeek-V4.1-Flash-1017),
 # NAME (container, default dsv41_sglang), PORT (default 30041), BUILD_DIR (host cache for the kernel build).
+# EPLB=1: SGLang's EPLB places the main model's experts from eplb_map_r8_ep8.pt (EP8, 384 experts + 8 replicas); another
+# placement: EPLB_MAP (host .pt, {'physical_to_logical_map'} or {'logical_count'}) and REDUNDANT (its replica count).
 # Extra arguments are appended to the server command line.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,6 +25,12 @@ mkdir -p "$BUILD_DIR"
 
 ENVS=(-e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1)
 DEV=()
+EPLB_MAP=${EPLB_MAP:-$([ "${EPLB:-0}" = 1 ] && echo "$HERE/eplb_map_r8_ep8.pt")}
+EPLB_VOL=() EPLB_ARGS=""
+if [ -n "$EPLB_MAP" ]; then
+  EPLB_VOL=(-v "$EPLB_MAP":/opt/eplb_map.pt:ro)
+  EPLB_ARGS="--init-expert-location /opt/eplb_map.pt --ep-num-redundant-experts ${REDUNDANT:-8}"
+fi
 if [ "$MEGA" = 1 ]; then
   ENVS+=(-e SGLANG_SM120_MEGA_MOE=1 -e SGLANG_SHARED_EXPERT_TP1=1
          -e SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=128
@@ -35,7 +44,7 @@ if [ "$MEGA" = 1 ]; then
 fi
 
 docker run -d --name "$NAME" --gpus all --ipc host --network host --shm-size 64g -u root --ulimit memlock=-1 \
-  "${DEV[@]}" "${ENVS[@]}" -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  "${DEV[@]}" "${ENVS[@]}" "${EPLB_VOL[@]}" -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
   -v "$MODEL_DIR":/models:ro -v "$HERE/kernel":/opt/sm120_megamoe:ro -v "$BUILD_DIR":/b \
   -v "$HERE/sglang_v0.5.22_dsv41.patch":/opt/sglang_v0.5.22_dsv41.patch:ro \
   --entrypoint bash lmsysorg/sglang:v0.5.22-cu130 -c "
@@ -46,5 +55,5 @@ docker run -d --name "$NAME" --gpus all --ipc host --network host --shm-size 64g
       --chunked-prefill-size 16384 --cuda-graph-max-bs-decode 16 --max-running-requests 128 --context-length 180000 \
       --speculative-algorithm DSPARK --speculative-dspark-block-size 5 --enable-dp-lm-head --swa-full-tokens-ratio 0.02 \
       --enable-metrics --enable-metrics-for-all-schedulers --incremental-streaming-output --stream-interval 1 \
-      --host 0.0.0.0 --port $PORT $*"
-echo "started $NAME (MEGA=$MEGA TRANSPORT=$TRANSPORT); logs: docker logs -f $NAME"
+      $EPLB_ARGS --host 0.0.0.0 --port $PORT $*"
+echo "started $NAME (MEGA=$MEGA TRANSPORT=$TRANSPORT EPLB_MAP=${EPLB_MAP:-none}); logs: docker logs -f $NAME"

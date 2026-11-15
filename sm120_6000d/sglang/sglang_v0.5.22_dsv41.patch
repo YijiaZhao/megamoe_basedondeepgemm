@@ -11,8 +11,26 @@ index dd03f26..b738cce 100644
  
  
  @functools.cache
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 1c09781..e59f9f8 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -1035,6 +1035,13 @@ class FusedMoE(torch.nn.Module):
+             return
+ 
+         global_expert_location_metadata = get_global_expert_location_metadata()
++        if (
++            global_expert_location_metadata is not None
++            and self.num_experts - self.num_fused_shared_experts
++            != global_expert_location_metadata.num_physical_experts
++        ):
++            # a draft model's MoE (other expert count) is not in the target's EPLB placement: logical = physical
++            global_expert_location_metadata = None
+         if global_expert_location_metadata is None:
+             if not getattr(param, "_sglang_require_global_experts", False):
+                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
 diff --git a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
-index 20d03d8..1660a0e 100644
+index 20d03d8..11c4e46 100644
 --- a/python/sglang/srt/layers/moe/mega_moe.py
 +++ b/python/sglang/srt/layers/moe/mega_moe.py
 @@ -163,6 +163,8 @@ def is_mega_moe_experts_ready(experts) -> bool:
@@ -24,7 +42,20 @@ index 20d03d8..1660a0e 100644
      # The SM100 mega kernels exist for compute capability 10.x only.
      return _device_sm // 10 == 10
  
-@@ -338,6 +340,25 @@ def run_mega_routed_experts(
+@@ -267,7 +269,11 @@ def _run_mega_routed(
+             if forward_batch is not None
+             else None
+         )
+-        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
++        dispatch_info = (
++            ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
++            if not moe.is_nextn
++            else None
++        )
+         if (
+             not moe.is_hash
+             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+@@ -338,6 +344,25 @@ def run_mega_routed_experts(
      from sglang.srt.runtime_context import get_parallel
  
      ep_group = get_parallel().moe_ep_group.device_group
@@ -265,6 +296,56 @@ index b8e6ff0..8663873 100644
              from flashinfer import block_scale_interleave
  
              if (
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index 4255da8..73a39bd 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -715,7 +715,10 @@ class DeepseekV2MoE(nn.Module):
+             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
+ 
+         self.experts = get_moe_impl_class(quant_config)(
+-            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
++            # EPLB's expert placement is the target model's: a draft (nextn) MoE, e.g. DSpark's 128 experts, keeps its
++            # own experts and logical ids
++            num_experts=num_experts_for_moe
++            + (0 if is_nextn else get_exec().moe.ep_num_redundant_experts),
+             num_fused_shared_experts=self.num_fused_shared_experts,
+             top_k=top_k_for_moe,
+             hidden_size=config.hidden_size,
+@@ -1081,7 +1084,7 @@ class DeepseekV2MoE(nn.Module):
+         )
+         dispatch_info = (
+             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+-            if get_exec().moe.enable_eplb and not self.is_nextn
++            if not self.is_nextn
+             else None
+         )
+ 
+@@ -1116,6 +1119,7 @@ class DeepseekV2MoE(nn.Module):
+                     router_logits,
+                     input_ids_global,
+                     num_token_non_padded=num_token_non_padded,
++                    expert_location_dispatch_info=dispatch_info,
+                 )
+             else:
+                 topk_output = self.topk(
+@@ -1245,7 +1249,7 @@ class DeepseekV2MoE(nn.Module):
+             return self.forward_cpu(hidden_states)
+         dispatch_info = (
+             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+-            if get_exec().moe.enable_eplb and not self.is_nextn
++            if not self.is_nextn
+             else None
+         )
+         defer_shared = not self.experts.moe_runner_config.inplace
+@@ -1295,6 +1299,7 @@ class DeepseekV2MoE(nn.Module):
+                     router_logits,
+                     input_ids_global,
+                     num_token_non_padded=num_token_non_padded,
++                    expert_location_dispatch_info=dispatch_info,
+                 )
+             else:
+                 topk_output = self.topk(
 diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
 index 55e900b..afd56ce 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
@@ -285,3 +366,35 @@ index 55e900b..afd56ce 100644
          _use_tp_moe_gather = (
              not _use_cp
              and get_parallel().attn_dp_size > 1
+diff --git a/python/sglang/srt/multimodal/dsv41/vl_routing.py b/python/sglang/srt/multimodal/dsv41/vl_routing.py
+index b03978d..e2a9077 100644
+--- a/python/sglang/srt/multimodal/dsv41/vl_routing.py
++++ b/python/sglang/srt/multimodal/dsv41/vl_routing.py
+@@ -2,6 +2,7 @@ import torch
+ import torch.nn.functional as F
+ 
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
++from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
+ from sglang.srt.layers.moe.topk import (
+     _RENORMALIZE_SUM_EPSILON,
+     StandardTopKOutput,
+@@ -51,6 +52,8 @@ def vision_topk(
+             num_fused_shared_experts == 0
+             and not use_mega_moe
+             and get_moe_runner_backend().is_flashinfer_mxfp4()
++            # the packed ids are the router's logical ids; EPLB needs the remapped ones
++            and expert_location_dispatch_info is None
+         ):
+             packed_topk = torch.empty(
+                 (logits.shape[0], config.top_k), dtype=torch.int32, device=logits.device
+@@ -160,6 +163,10 @@ def _finish_vision_topk(
+                 topk_ids=recorder_ids
+             )
+     else:
++        if expert_location_dispatch_info is not None:
++            # EPLB without a MegaMoE a2a backend (e.g. --moe-a2a-backend none): the experts hold physical slots
++            indices = topk_ids_logical_to_physical(indices, expert_location_dispatch_info)
++            padded_rows_masked = False  # the remap reads padded (-1) rows as the last expert: mask them again
+         weights = _scale_fused_shared_weights(
+             weights,
+             config.num_fused_shared_experts,
