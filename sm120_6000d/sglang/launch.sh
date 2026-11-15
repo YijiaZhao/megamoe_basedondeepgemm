@@ -4,7 +4,7 @@
 # kernel/ (this directory's copy of the SM120 FP4 MegaMoE with the 'w4a8_rm' format) as the kernel source and launches
 # the server. See README.md.
 #   MODEL_DIR=/raid/models bash launch.sh                  # MegaMoE, PCIe P2P (Broadcom-switch hosts, e.g. .20)
-#   MODEL_DIR=/raid/models TRANSPORT=auto bash launch.sh   # MegaMoE, cross-root-port peers over the NICs (CX8aaS)
+#   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable bash launch.sh   # MegaMoE, peers NCCL cannot map for P2P over the NICs (CX8aaS)
 #   MODEL_DIR=/raid/models MEGA=0 bash launch.sh           # baseline: stock FlashInfer MoE (startup fix only)
 # Environment: MODEL_DIR (host dir holding the model), MODEL (dir name, default DeepSeek-V4.1-Flash-1017),
 # NAME (container, default dsv41_sglang), PORT (default 30041), BUILD_DIR (host cache for the kernel build).

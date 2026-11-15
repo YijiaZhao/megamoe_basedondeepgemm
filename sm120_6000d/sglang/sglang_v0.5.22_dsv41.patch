@@ -1,7 +1,8 @@
-diff -ruN a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
+diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
+index dd03f26..b738cce 100644
 --- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
 +++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
-@@ -43,7 +43,7 @@
+@@ -43,7 +43,7 @@ __all__ = [
  def is_sm100_or_newer() -> bool:
      # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
      # take the torch indexer.
@@ -10,10 +11,11 @@ diff -ruN a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py b/py
  
  
  @functools.cache
-diff -ruN a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
+diff --git a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
+index 20d03d8..1660a0e 100644
 --- a/python/sglang/srt/layers/moe/mega_moe.py
 +++ b/python/sglang/srt/layers/moe/mega_moe.py
-@@ -163,6 +163,8 @@
+@@ -163,6 +163,8 @@ def is_mega_moe_experts_ready(experts) -> bool:
          return False
      if _device_sm == 90:
          return is_sm90_fp8_mega_moe_available(experts)
@@ -22,7 +24,7 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/
      # The SM100 mega kernels exist for compute capability 10.x only.
      return _device_sm // 10 == 10
  
-@@ -338,6 +340,25 @@
+@@ -338,6 +340,25 @@ def run_mega_routed_experts(
      from sglang.srt.runtime_context import get_parallel
  
      ep_group = get_parallel().moe_ep_group.device_group
@@ -48,10 +50,12 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/
      num_experts = experts.num_experts
      num_max_tokens_per_rank = (
          envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/layers/moe/mega_moe_sm120.py
+diff --git a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/layers/moe/mega_moe_sm120.py
+new file mode 100644
+index 0000000..864fdcd
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/mega_moe_sm120.py
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,191 @@
 +# Copyright 2023-2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -96,7 +100,7 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/l
 +
 +_FMT = "w4a8_rm"
 +_LOGGED = set()
-+_SHAPE = None  # (experts, top-k) of the first layer built: the kernel holds one buffer per process
++_SLOTS: dict = {}  # (experts, top-k) -> buffer slot, in build order (the main model, then a draft model's MoE)
 +_MODULE = None
 +_BUFFER: dict = {}
 +
@@ -140,10 +144,11 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/l
 +    else:
 +        global_num_tokens = get_dp_global_num_tokens()
 +        use = bool(global_num_tokens) and max(global_num_tokens) <= _max_tokens_per_rank()
-+    if use not in _LOGGED:  # once per process and path
-+        _LOGGED.add(use)
-+        logger.info("SM120 MegaMoE: first call on the %s path (%d local tokens)",
-+                    "mega kernel" if use else "configured MoE", hidden_states.shape[0])
++    key = (use, moe.experts.num_experts)
++    if key not in _LOGGED:  # once per process, path and MoE shape
++        _LOGGED.add(key)
++        logger.info("SM120 MegaMoE: first call on the %s path (%d experts, %d local tokens)",
++                    "mega kernel" if use else "configured MoE", moe.experts.num_experts, hidden_states.shape[0])
 +    return use
 +
 +
@@ -158,16 +163,9 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/l
 +def build_sm120_mega_moe_scales(experts, w13_up_first: bool) -> None:
 +    """At load, from the checkpoint's scales (before another backend rearranges them): the kernel's scale copy.
 +    `w13_up_first`: W13 holds the up rows first (FlashInfer CUTLASS loads it that way)."""
-+    global _SHAPE
 +    if getattr(experts, "_mega_moe_weights_built", False):
 +        return
-+    shape = (experts.num_experts, experts.top_k)
-+    if _SHAPE is None:
-+        _SHAPE = shape
-+    elif shape != _SHAPE:  # e.g. a draft model's MoE: it keeps the configured path
-+        logger.info("SM120 MegaMoE: %s experts / top-%d stays on the configured MoE (mega kernel: %s)",
-+                    shape[0], shape[1], _SHAPE)
-+        return
++    _SLOTS.setdefault((experts.num_experts, experts.top_k), len(_SLOTS))
 +    fp4 = sm120_fp4()
 +    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
 +    s13 = _ue8m0_bytes(experts.w13_weight_scale_inv.data)
@@ -194,11 +192,13 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/l
 +                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at most "
 +                f"{cap} (now {num_max_tokens_per_rank})."
 +            )
-+        # p2p (default) or auto / nic (NCCL GIN over the NICs for peers P2P serves badly, e.g. CX8aaS hosts)
++        # p2p (default) or an NCCL-window transport of sm120_fp4.TRANSPORTS (e.g. lsa_where_reachable on CX8aaS hosts)
 +        transport = os.environ.get("SGLANG_SM120_MEGA_MOE_TRANSPORT", "p2p")
-+        logger.info("SM120 MegaMoE buffer: EP%d, transport %s", world, transport)
++        slot = _SLOTS[num_experts, top_k]
++        logger.info("SM120 MegaMoE buffer: EP%d, %d experts / top-%d (slot %d), transport %s",
++                    world, num_experts, top_k, slot, transport)
 +        buf = sm120_fp4().Sm120Fp4MegaMoeBuffer(
-+            group, _FMT, num_experts, num_max_tokens_per_rank, top_k, hidden, inter, transport=transport
++            group, _FMT, num_experts, num_max_tokens_per_rank, top_k, hidden, inter, transport=transport, slot=slot
 +        )
 +        _BUFFER[key] = buf
 +    return buf
@@ -247,10 +247,11 @@ diff -ruN a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/l
 +    if routed_scaling_factor != 1.0:
 +        y.mul_(routed_scaling_factor)
 +    return y
-diff -ruN a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
+index b8e6ff0..8663873 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-@@ -153,6 +153,13 @@
+@@ -153,6 +153,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
          w2_scale_u8 = layer.w2_weight_scale_inv.data.view(torch.uint8)
  
          if self._use_mxfp8_act_scaling:
@@ -264,10 +265,11 @@ diff -ruN a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.p
              from flashinfer import block_scale_interleave
  
              if (
-diff -ruN a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 55e900b..afd56ce 100644
 --- a/python/sglang/srt/models/deepseek_v4.py
 +++ b/python/sglang/srt/models/deepseek_v4.py
-@@ -3431,6 +3431,15 @@
+@@ -3431,6 +3431,15 @@ class DeepseekV4DecoderLayer(nn.Module):
          return_moe_output: bool = False,
      ) -> Union[torch.Tensor, deepseek_v2.MoEOutput]:
          _use_cp = is_cp_active(forward_batch)
