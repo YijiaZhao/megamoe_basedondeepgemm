@@ -60,6 +60,7 @@ docker rm -f dsv41_sglang                        # 停掉
 | `layers/moe/fused_moe_triton/layer.py` | EPLB：draft 模型的 MoE 加载权重时不用主模型的专家放置 |
 | `../kernels/ops/attention/dsv4/fp4_indexer.py` | 新 Triton kernel `fp4_index_logits_grouped`：target verify 时同一请求的 6 行（5 个 draft token + 1）共用一次 K tile 的读取和 FP4 反量化，按实际长度跳过空 tile；结果与 `fp4_index_logits_decode` 比特级一致 |
 | `layers/attention/dsv4/v41_indexer/scoring.py` | `SGLANG_SM120_INDEXER_GROUP` > 0 且是 verify 时，ratio-1/2 层的 decode 打分走上面的 kernel，不再生成 [行数, L] 的 slot 表，只对选中的 top-k 位置查 `req_to_token` |
+| `layers/quantization/fp8_utils.py` | `SGLANG_SM120_MXFP8_B12X_MIN_N` > 0 时（SM120，`--fp8-gemm-backend flashinfer_cutlass`）：按 MXFP8 跑的 FP8 线性层里，输出行数 ≥ 该值且 K % 128 == 0 的走 FlashInfer 的 SM120 `b12x` kernel，其余仍走 CUTLASS；都用默认 tactic，权重和 scale 不变 |
 
 router（gate + topk）用 SGLang 自己的，结果传给 kernel。主模型和 DSPARK draft 模型的 routed experts 都走 kernel，draft 也不再做 DP gather / scatter。
 不走 kernel 的部分：prefill / chunked prefill（任一 rank 超过 128 token）、shared expert、attention。
@@ -81,6 +82,8 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash lau
 
 **FP8 GEMM 与 indexer**（`DENSE_OPT`，`MEGA=1` 时默认 `1`，`MEGA=0` 时默认 `0`）：
 - `--fp8-gemm-backend flashinfer_cutlass`：模型的 FP8 线性层（attention 投影、共享专家等，32×32 块、ue8m0 scale）按 MXFP8 原样交给 FlashInfer CUTLASS，权重不变；默认会走未调优的 Triton。
+- `SGLANG_SM120_MXFP8_B12X_MIN_N=4096`：上面这些层里输出行数 ≥ 4096 的（`wq_b`、`wo_b`、indexer `wq_b`、共享专家）改走 FlashInfer 的 SM120 `b12x` kernel，
+  `wq_a + wkv`（1792 行）留在 CUTLASS。单测（每 rank 96 token，冷 L2）每层合计 302 → 245 µs。
 - `SGLANG_SM120_INDEXER_GROUP=6`：verify 的 indexer 打分走分组 kernel（见上表）。正确性和单次耗时：`test_indexer_grouped.py`（文件头有命令）。
 
 `DENSE_OPT=0` 回到 SGLang 自带的 Triton FP8 GEMM 和原 indexer。
@@ -98,6 +101,7 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash lau
 | `SGLANG_SM120_MEGA_MOE_TRANSPORT` | `p2p` / `lsa_where_reachable` | 传输方式，见下节；其余可选值见 `kernel/deep_gemm/mega/sm120_fp4.py` 的 `TRANSPORTS` |
 | `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE` | `1` | 上游开关（基线也开）：engram 表放主机内存，否则 `mem-fraction-static 0.8` 放不下 KV |
 | `SGLANG_SM120_INDEXER_GROUP` | `6`（`DENSE_OPT=1`）| verify 每个请求的行数（draft token + 1），分组 indexer；`0` 为原 indexer |
+| `SGLANG_SM120_MXFP8_B12X_MIN_N` | `4096`（`DENSE_OPT=1`）| 输出行数 ≥ 该值的 FP8 线性层走 `b12x`；`0` 全走 CUTLASS |
 
 ## 网卡（`TRANSPORT=lsa_where_reachable`）
 
@@ -140,13 +144,15 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 |---|---|---|---|---|---|
 | .6（CX8aaS）| `lsa_where_reachable` + 8 网卡 | 58.5 / 57.6 / 75.5 | 48.2 / 48.1 / 65.1 | −16.5% | 2332 → 2745 |
 | .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=0` | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 44.3 / 45.6 / 60.6 | −18.7% | 2589 → 3032 |
-| .1（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`² | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **36.2 / 35.5 / 48.2** | −36.7% | 2589 → **3826** |
+| .1（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1` 不含 `b12x`² | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 36.2 / 35.5 / 48.2 | −36.7% | 2589 → 3826 |
+| .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`（默认）³ | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **33.1 / 32.7 / 43.7** | −41.7% | 2589 → **3989** |
 | .20（Broadcom）¹ | `p2p` | — / 57.3 / 80.2 | — / 48.8 / 64.7 | −14.8% | 2217 → 2818 |
 
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
-² 基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；
-按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
+² 当时 FP8 线性层全走 CUTLASS（`SGLANG_SM120_MXFP8_B12X_MIN_N=0`）。基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。
+每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
+³ 每步间隔 69.2 ms；按 10 步 profile，FP8 GEMM 每步 10.8 → 7.5 ms（`b12x`），整步 72.9 → 69.6 ms，其余部分不变。
 
 精度：gsm8k（1319 题，128 并发）基线 0.907，MegaMoE（主模型 + draft，.6）0.900；开 EPLB：基线 0.917，MegaMoE 0.918；
-EPLB + `DENSE_OPT=1`：0.909。
+EPLB + `DENSE_OPT=1`：不含 `b12x` 0.909，含 `b12x` 0.903。
 逐层对比（同一输入，kernel 对 FlashInfer）：相对误差中位数 1.4%，余弦相似度 ≥ 0.9997。

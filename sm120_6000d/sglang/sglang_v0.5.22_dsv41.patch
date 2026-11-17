@@ -482,6 +482,52 @@ index 0000000..864fdcd
 +    if routed_scaling_factor != 1.0:
 +        y.mul_(routed_scaling_factor)
 +    return y
+diff --git a/python/sglang/srt/layers/quantization/fp8_utils.py b/python/sglang/srt/layers/quantization/fp8_utils.py
+index 6fa480b..6bea1f2 100755
+--- a/python/sglang/srt/layers/quantization/fp8_utils.py
++++ b/python/sglang/srt/layers/quantization/fp8_utils.py
+@@ -5,6 +5,8 @@ from enum import Enum
+ from functools import lru_cache, partial
+ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+ 
++import os
++
+ import torch
+ 
+ from sglang.kernels.ops.gemm.fp8_kernel import (
+@@ -801,8 +803,32 @@ def can_serve_block_fp8_as_mxfp8(
+     return not resolve_block_fp8_mxfp8_backend().is_unsupported()
+ 
+ 
++def sm120_mxfp8_blockscaled_linear(
++    input: torch.Tensor,
++    weight: torch.Tensor,
++    weight_scale: torch.Tensor,
++    input_scale: Optional[torch.Tensor] = None,
++    bias: Optional[torch.Tensor] = None,
++    output_dtype: Optional[torch.dtype] = None,
++    pin_tactic: bool = True,
++    *,
++    b12x_min_n: int,
++) -> torch.Tensor:
++    """flashinfer_mxfp8_blockscaled_linear on SM120: the b12x kernel (small-M decode tiles) for weights with at least
++    b12x_min_n output rows and K % 128 == 0, CUTLASS otherwise; same swizzled weight scales, default tactics."""
++    n, k = weight.shape
++    backend = "b12x" if n >= b12x_min_n and k % 128 == 0 else "cutlass"
++    return flashinfer_mxfp8_blockscaled_linear(
++        input, weight, weight_scale, input_scale, bias, output_dtype,
++        backend=backend, pin_tactic=True,
++    )
++
++
+ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
+     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
++    b12x_min_n = int(os.environ.get("SGLANG_SM120_MXFP8_B12X_MIN_N", "0"))
++    if backend.is_flashinfer_cutlass() and b12x_min_n > 0 and get_platform().is_sm120:
++        return partial(sm120_mxfp8_blockscaled_linear, b12x_min_n=b12x_min_n)
+     if backend.is_flashinfer_cutlass():
+         return partial(
+             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 index b8e6ff0..8663873 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py

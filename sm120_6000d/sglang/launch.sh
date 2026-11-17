@@ -10,7 +10,8 @@
 # Environment: MODEL_DIR (host dir holding the model), MODEL (dir name, default DeepSeek-V4.1-Flash-1017),
 # NAME (container, default dsv41_sglang), PORT (default 30041), BUILD_DIR (host cache for the kernel build).
 # DENSE_OPT (default 1 with MEGA=1, 0 with MEGA=0): block-FP8 linears on FlashInfer CUTLASS (--fp8-gemm-backend
-# flashinfer_cutlass: the 32x32 ue8m0 weights served as MXFP8, unchanged) and the grouped verify indexer
+# flashinfer_cutlass: the 32x32 ue8m0 weights served as MXFP8, unchanged; SGLANG_SM120_MXFP8_B12X_MIN_N=4096 moves
+# the layers with >= 4096 output rows to FlashInfer's SM120 b12x kernel) and the grouped verify indexer
 # (SGLANG_SM120_INDEXER_GROUP = draft tokens + 1); DENSE_OPT=0 keeps SGLang's Triton FP8 GEMM and stock indexer.
 # EPLB=1: SGLang's EPLB places the main model's experts from eplb_map_r8_ep8.pt (EP8, 384 experts + 8 replicas); another
 # placement: EPLB_MAP (host .pt, {'physical_to_logical_map'} or {'logical_count'}) and REDUNDANT (its replica count).
@@ -48,7 +49,7 @@ fi
 DSPARK_BLOCK=5
 DENSE_ARGS=""
 if [ "${DENSE_OPT:-$MEGA}" = 1 ]; then
-  ENVS+=(-e SGLANG_SM120_INDEXER_GROUP=$((DSPARK_BLOCK + 1)))
+  ENVS+=(-e SGLANG_SM120_INDEXER_GROUP=$((DSPARK_BLOCK + 1)) -e SGLANG_SM120_MXFP8_B12X_MIN_N=4096)
   DENSE_ARGS="--fp8-gemm-backend flashinfer_cutlass"
 fi
 
