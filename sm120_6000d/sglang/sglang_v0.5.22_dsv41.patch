@@ -1,3 +1,137 @@
+diff --git a/python/sglang/kernels/ops/attention/dsv4/fp4_indexer.py b/python/sglang/kernels/ops/attention/dsv4/fp4_indexer.py
+index 213d97c..36c46fa 100644
+--- a/python/sglang/kernels/ops/attention/dsv4/fp4_indexer.py
++++ b/python/sglang/kernels/ops/attention/dsv4/fp4_indexer.py
+@@ -944,3 +944,129 @@ def fp4_index_logits_paged(
+         num_warps=4,
+     )
+     return out[:, :max_len]
++
++
++@triton.jit
++def _fp4_index_logits_grouped_kernel(
++    q_ptr,  # [B, H, D] bf16
++    w_ptr,  # [B, H] bf16
++    req_ptr,  # [B] int64; rows g*G .. g*G+G-1 share one request (target verify's repeat_interleave)
++    req_table_ptr,  # [num_reqs, max_tokens] int32 req_to_token
++    lens_ptr,  # [B] int64
++    table_ptr,
++    out_ptr,  # [B, L] fp32
++    L,
++    page_size,
++    row_stride,
++    req_stride,
++    stride_qb,
++    stride_qh,
++    stride_wb,
++    H: tl.constexpr,
++    HALF_D: tl.constexpr,
++    G: tl.constexpr,
++    RATIO: tl.constexpr,
++    BLOCK_L: tl.constexpr,
++):
++    row0 = tl.program_id(0) * G
++    offs_l = tl.program_id(1) * BLOCK_L + tl.arange(0, BLOCK_L)
++    req0 = tl.load(req_ptr + row0).to(tl.int64)
++    n_max = tl.load(lens_ptr + row0)
++    for g in tl.static_range(1, G):
++        n_max = tl.maximum(n_max, tl.load(lens_ptr + row0 + g))
++    n_max = tl.minimum(n_max, L)
++    # Graph replay keeps the capacity-sized grid even for short live contexts: skip whole invisible tiles.
++    if tl.program_id(1) * BLOCK_L >= n_max:
++        for g in tl.static_range(G):
++            tl.store(out_ptr + (row0 + g) * L + offs_l, float("-inf"), mask=offs_l < L)
++        return
++    lvalid = offs_l < n_max
++    slot = (
++        tl.load(req_table_ptr + req0 * req_stride + offs_l * RATIO, mask=lvalid, other=0).to(tl.int64)
++        // RATIO
++    )
++    page = slot // page_size
++    off = slot % page_size
++    row_base = page * row_stride
++    offs_i = tl.arange(0, HALF_D)
++    offs_h = tl.arange(0, H)
++    pay = tl.load(
++        table_ptr + row_base[:, None] + off[:, None] * INDEX_K_PAYLOAD_BYTES + offs_i[None, :],
++        mask=lvalid[:, None],
++        other=0,
++    )
++    exps = tl.load(
++        table_ptr
++        + row_base[:, None]
++        + page_size * INDEX_K_PAYLOAD_BYTES
++        + off[:, None] * INDEX_K_SCALE_BYTES
++        + (offs_i // 16)[None, :],
++        mask=lvalid[:, None],
++        other=127,
++    )
++    scale = tl.exp2(exps.to(tl.float32) - 127.0)
++    k_low = (_e2m1_decode(pay & 0x0F) * scale).to(tl.bfloat16)
++    k_high = (_e2m1_decode((pay >> 4) & 0x0F) * scale).to(tl.bfloat16)
++    for g in tl.static_range(G):
++        b = row0 + g
++        n_vis = tl.minimum(tl.load(lens_ptr + b), L)
++        valid = offs_l < n_vis
++        qb = q_ptr + b * stride_qb + offs_h[:, None] * stride_qh + 2 * offs_i[None, :]
++        acc = tl.dot(tl.load(qb), tl.trans(k_low))
++        acc += tl.dot(tl.load(qb + 1), tl.trans(k_high))
++        s = tl.maximum(acc.to(tl.bfloat16).to(tl.float32), 0.0)
++        w = tl.load(w_ptr + b * stride_wb + offs_h).to(tl.float32)
++        s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
++        logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
++        logit = tl.where(valid, logit, float("-inf"))
++        tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
++
++
++def fp4_index_logits_grouped(
++    q: torch.Tensor,
++    weights: torch.Tensor,
++    req: torch.Tensor,
++    req_table: torch.Tensor,
++    lens: torch.Tensor,
++    table: torch.Tensor,
++    page_size: int,
++    max_len: int,
++    ratio: int,
++    group: int,
++) -> torch.Tensor:
++    """fp4_index_logits_decode for rows whose consecutive groups of `group` share a request (target verify, where
++    token_req_indices repeat-interleaves each request draft_token_num times; graph padding rows too): the logits
++    [B, max_len] fp32, -inf at positions >= lens, bit-exact with it; slots come from req_table."""
++    assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
++    assert table.dtype == torch.uint8 and table.dim() == 2 and req_table.stride(1) == 1
++    B, H, _ = q.shape
++    assert B % group == 0
++    q = q.contiguous()
++    weights = weights.to(torch.bfloat16).contiguous()
++    out = torch.empty((B, max_len), dtype=torch.float32, device=q.device)
++    if B == 0 or max_len == 0:
++        return out
++    BLOCK_L = 64
++    _fp4_index_logits_grouped_kernel[(B // group, triton.cdiv(max_len, BLOCK_L))](
++        q,
++        weights,
++        req.to(torch.int64).contiguous(),
++        req_table,
++        lens.to(torch.int64).contiguous(),
++        table,
++        out,
++        max_len,
++        page_size,
++        table.stride(0),
++        req_table.stride(0),
++        q.stride(0),
++        q.stride(1),
++        weights.stride(0),
++        H=H,
++        HALF_D=INDEX_HEAD_DIM // 2,
++        G=group,
++        RATIO=ratio,
++        BLOCK_L=BLOCK_L,
++        num_warps=8,
++    )
++    return out
 diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
 index dd03f26..b738cce 100644
 --- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/__init__.py
@@ -11,6 +145,76 @@ index dd03f26..b738cce 100644
  
  
  @functools.cache
+diff --git a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
+index ea90f9a..d01fd56 100644
+--- a/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
++++ b/python/sglang/srt/layers/attention/dsv4/v41_indexer/scoring.py
+@@ -5,6 +5,7 @@ a selection back into pool slots."""
+ from __future__ import annotations
+ 
+ import itertools
++import os
+ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
+ 
+ import msgspec
+@@ -13,6 +14,7 @@ import torch
+ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+     finish_paged_indexer_topk,
+     fp4_index_logits_decode,
++    fp4_index_logits_grouped,
+     fp4_index_logits_paged,
+ )
+ from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
+@@ -270,12 +272,20 @@ class ChunkScores(msgspec.Struct, frozen=True):
+     scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+ 
+ 
++# SGLANG_SM120_INDEXER_GROUP=g (> 0): target verify's rows come in groups of g per request (draft tokens + 1); the
++# ratio-1/2 decode scoring then shares each K tile load across a group (fp4_index_logits_grouped).
++_SM120_INDEXER_GROUP = int(os.environ.get("SGLANG_SM120_INDEXER_GROUP", "0"))
++
++
+ class DecodeScores(msgspec.Struct, frozen=True):
+     bs: int
+     lmax: int
+     lens: torch.Tensor  # [bs]
+-    slots: torch.Tensor  # [bs, lmax]
++    slots: Optional[torch.Tensor]  # [bs, lmax]; None: looked up from req_to_token at the picks
+     scores: torch.Tensor  # [bs, lmax]
++    req: Optional[torch.Tensor] = None  # [bs] req_to_token rows, when slots is None
++    req_to_token: Optional[torch.Tensor] = None
++    ratio: int = 1
+ 
+ 
+ def prefill_requests(
+@@ -430,6 +440,15 @@ def decode_scores(
+             has_candidate_mask=candidate_mask is not None,
+         )
+     inputs.reset_outputs()
++    group = _SM120_INDEXER_GROUP
++    if group > 0 and inputs.is_verify and bs % group == 0:
++        scores = fp4_index_logits_grouped(
++            q, weights, req, req_to_token, lens, table, table.shape[1] // 68, lmax, ratio, group
++        )
++        return DecodeScores(
++            bs=bs, lmax=lmax, lens=lens, slots=None, scores=scores,
++            req=req, req_to_token=req_to_token, ratio=ratio,
++        )
+     j = torch.arange(lmax, device=pos.device)
+     valid = j[None, :] < lens[:, None]
+     slots = req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64) // ratio
+@@ -467,5 +486,10 @@ def write_decode(inputs: DecodeInputs, d: DecodeScores, idx: torch.Tensor) -> No
+     idx = idx.sort(dim=-1).values
+     reach = idx < d.lens[:, None]
+     inputs.out_page_indices[: d.bs, :k] = torch.where(
+-        reach, d.slots.gather(1, idx.clamp_max(d.lmax - 1)), -1
++        reach,
++        d.slots.gather(1, idx.clamp_max(d.lmax - 1))
++        if d.slots is not None
++        else d.req_to_token[d.req[:, None], idx.clamp_max(d.lmax - 1).to(torch.int64) * d.ratio].to(torch.int64)
++        // d.ratio,
++        -1
+     ).to(torch.int32)
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index 1c09781..e59f9f8 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py

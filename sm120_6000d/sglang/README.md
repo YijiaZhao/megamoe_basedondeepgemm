@@ -58,6 +58,8 @@ docker rm -f dsv41_sglang                        # 停掉
 | `multimodal/dsv41/vl_routing.py` | EPLB：DSV4.1 的 router 走 `vision_topk`，上游只在 MegaMoE a2a 后端时把逻辑专家号换成物理专家号；`--moe-a2a-backend none` 时也换（不换则 gsm8k 掉到 0.02）|
 | `models/deepseek_v2.py` | EPLB：冗余专家只加给主模型，DSPARK draft（128 专家）不加；`vision_topk` 传 `expert_location_dispatch_info` |
 | `layers/moe/fused_moe_triton/layer.py` | EPLB：draft 模型的 MoE 加载权重时不用主模型的专家放置 |
+| `../kernels/ops/attention/dsv4/fp4_indexer.py` | 新 Triton kernel `fp4_index_logits_grouped`：target verify 时同一请求的 6 行（5 个 draft token + 1）共用一次 K tile 的读取和 FP4 反量化，按实际长度跳过空 tile；结果与 `fp4_index_logits_decode` 比特级一致 |
+| `layers/attention/dsv4/v41_indexer/scoring.py` | `SGLANG_SM120_INDEXER_GROUP` > 0 且是 verify 时，ratio-1/2 层的 decode 打分走上面的 kernel，不再生成 [行数, L] 的 slot 表，只对选中的 top-k 位置查 `req_to_token` |
 
 router（gate + topk）用 SGLang 自己的，结果传给 kernel。主模型和 DSPARK draft 模型的 routed experts 都走 kernel，draft 也不再做 DP gather / scatter。
 不走 kernel 的部分：prefill / chunked prefill（任一 rank 超过 128 token）、shared expert、attention。
@@ -69,12 +71,19 @@ MODEL_DIR=/raid/models bash launch.sh                  # MegaMoE，卡间全走 
 MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable bash launch.sh   # MegaMoE，NCCL 映射不了 P2P 的卡间走网卡（CX8aaS）
 MODEL_DIR=/raid/models MEGA=0 bash launch.sh           # 基线：原版 FlashInfer MoE（只带启动修复）
 MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # 再开 EPLB（8 个冗余专家），最快；MEGA=0 也能加
+MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash launch.sh   # FP8 GEMM 和 indexer 用 SGLang 自带的
 ```
 
 **EPLB**（`EPLB=1`）：`--init-expert-location eplb_map_r8_ep8.pt --ep-num-redundant-experts 8`。主模型 384 个专家加 8 个副本，
 每卡 49 个，热门专家复制、按负载摊到 8 张卡；draft 模型不动。`eplb_map_r8_ep8.pt` 是 `{'physical_to_logical_map': [40 层, 392]}`：
 在同一个 decode bench（pg19，每 rank BS16、输入 100K）上统计主模型每层每个专家的 token 数，用 SGLang 的
 `eplb_algorithms.rebalance_experts`（`auto`，单机，8 卡）算出来。换负载或卡数要另算一份，用 `EPLB_MAP=<文件> REDUNDANT=<副本数>` 传入。
+
+**FP8 GEMM 与 indexer**（`DENSE_OPT`，`MEGA=1` 时默认 `1`，`MEGA=0` 时默认 `0`）：
+- `--fp8-gemm-backend flashinfer_cutlass`：模型的 FP8 线性层（attention 投影、共享专家等，32×32 块、ue8m0 scale）按 MXFP8 原样交给 FlashInfer CUTLASS，权重不变；默认会走未调优的 Triton。
+- `SGLANG_SM120_INDEXER_GROUP=6`：verify 的 indexer 打分走分组 kernel（见上表）。正确性和单次耗时：`test_indexer_grouped.py`（文件头有命令）。
+
+`DENSE_OPT=0` 回到 SGLang 自带的 Triton FP8 GEMM 和原 indexer。
 
 `launch.sh` 把 `kernel/` 挂成 kernel 源码（`/opt/sm120_megamoe`），kernel 第一次调用时按 `sm_120a` 编译，缓存在 `BUILD_DIR`。
 服务端参数和下面性能表用的一致，写在脚本里；多余参数追加到命令末尾。
@@ -88,6 +97,7 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # �
 | `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` | `128` | 每 rank token 上限，也是缓冲区大小 |
 | `SGLANG_SM120_MEGA_MOE_TRANSPORT` | `p2p` / `lsa_where_reachable` | 传输方式，见下节；其余可选值见 `kernel/deep_gemm/mega/sm120_fp4.py` 的 `TRANSPORTS` |
 | `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE` | `1` | 上游开关（基线也开）：engram 表放主机内存，否则 `mem-fraction-static 0.8` 放不下 KV |
+| `SGLANG_SM120_INDEXER_GROUP` | `6`（`DENSE_OPT=1`）| verify 每个请求的行数（draft token + 1），分组 indexer；`0` 为原 indexer |
 
 ## 网卡（`TRANSPORT=lsa_where_reachable`）
 
@@ -129,10 +139,14 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 | 机器 | 传输 | 基线 TPOT P50 / 平均 / P95 (ms) | MegaMoE TPOT P50 / 平均 / P95 (ms) | TPOT 平均 | 全机输出 tok/s（基线 → MegaMoE）|
 |---|---|---|---|---|---|
 | .6（CX8aaS）| `lsa_where_reachable` + 8 网卡 | 58.5 / 57.6 / 75.5 | 48.2 / 48.1 / 65.1 | −16.5% | 2332 → 2745 |
-| .6（CX8aaS），EPLB 8 个冗余专家 | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **44.3 / 45.6 / 60.6** | −18.7% | 2589 → **3032** |
+| .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=0` | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 44.3 / 45.6 / 60.6 | −18.7% | 2589 → 3032 |
+| .1（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`² | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **36.2 / 35.5 / 48.2** | −36.7% | 2589 → **3826** |
 | .20（Broadcom）¹ | `p2p` | — / 57.3 / 80.2 | — / 48.8 / 64.7 | −14.8% | 2217 → 2818 |
 
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
+² 基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；
+按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
 
-精度：gsm8k（1319 题，128 并发）基线 0.907，MegaMoE（主模型 + draft，.6）0.900；开 EPLB：基线 0.917，MegaMoE 0.918。
+精度：gsm8k（1319 题，128 并发）基线 0.907，MegaMoE（主模型 + draft，.6）0.900；开 EPLB：基线 0.917，MegaMoE 0.918；
+EPLB + `DENSE_OPT=1`：0.909。
 逐层对比（同一输入，kernel 对 FlashInfer）：相对误差中位数 1.4%，余弦相似度 ≥ 0.9997。

@@ -9,6 +9,9 @@
 #   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # + EPLB, 8 redundant experts (fastest)
 # Environment: MODEL_DIR (host dir holding the model), MODEL (dir name, default DeepSeek-V4.1-Flash-1017),
 # NAME (container, default dsv41_sglang), PORT (default 30041), BUILD_DIR (host cache for the kernel build).
+# DENSE_OPT (default 1 with MEGA=1, 0 with MEGA=0): block-FP8 linears on FlashInfer CUTLASS (--fp8-gemm-backend
+# flashinfer_cutlass: the 32x32 ue8m0 weights served as MXFP8, unchanged) and the grouped verify indexer
+# (SGLANG_SM120_INDEXER_GROUP = draft tokens + 1); DENSE_OPT=0 keeps SGLang's Triton FP8 GEMM and stock indexer.
 # EPLB=1: SGLang's EPLB places the main model's experts from eplb_map_r8_ep8.pt (EP8, 384 experts + 8 replicas); another
 # placement: EPLB_MAP (host .pt, {'physical_to_logical_map'} or {'logical_count'}) and REDUNDANT (its replica count).
 # Extra arguments are appended to the server command line.
@@ -42,6 +45,12 @@ if [ "$MEGA" = 1 ]; then
     DEV=(--device /dev/infiniband --cap-add IPC_LOCK)
   fi
 fi
+DSPARK_BLOCK=5
+DENSE_ARGS=""
+if [ "${DENSE_OPT:-$MEGA}" = 1 ]; then
+  ENVS+=(-e SGLANG_SM120_INDEXER_GROUP=$((DSPARK_BLOCK + 1)))
+  DENSE_ARGS="--fp8-gemm-backend flashinfer_cutlass"
+fi
 
 docker run -d --name "$NAME" --gpus all --ipc host --network host --shm-size 64g -u root --ulimit memlock=-1 \
   "${DEV[@]}" "${ENVS[@]}" "${EPLB_VOL[@]}" -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
@@ -53,7 +62,7 @@ docker run -d --name "$NAME" --gpus all --ipc host --network host --shm-size 64g
       --tp 8 --dp 8 --enable-dp-attention --ep-size 8 --moe-a2a-backend none --moe-runner-backend flashinfer_mxfp4 \
       --page-size 256 --mem-fraction-static 0.8 --watchdog-timeout 3600 \
       --chunked-prefill-size 16384 --cuda-graph-max-bs-decode 16 --max-running-requests 128 --context-length 180000 \
-      --speculative-algorithm DSPARK --speculative-dspark-block-size 5 --enable-dp-lm-head --swa-full-tokens-ratio 0.02 \
+      --speculative-algorithm DSPARK --speculative-dspark-block-size $DSPARK_BLOCK --enable-dp-lm-head --swa-full-tokens-ratio 0.02 \
       --enable-metrics --enable-metrics-for-all-schedulers --incremental-streaming-output --stream-interval 1 \
-      $EPLB_ARGS --host 0.0.0.0 --port $PORT $*"
-echo "started $NAME (MEGA=$MEGA TRANSPORT=$TRANSPORT EPLB_MAP=${EPLB_MAP:-none}); logs: docker logs -f $NAME"
+      $EPLB_ARGS $DENSE_ARGS --host 0.0.0.0 --port $PORT $*"
+echo "started $NAME (MEGA=$MEGA TRANSPORT=$TRANSPORT EPLB_MAP=${EPLB_MAP:-none} DENSE_OPT=${DENSE_OPT:-$MEGA}); logs: docker logs -f $NAME"
