@@ -11,6 +11,8 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 | `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变；路由计数按 epoch 奇偶双缓冲（与仓库主 kernel 相同） |
 | `deep_gemm/mega/sm120_fp4.py` | `FORMATS` 加 `w4a8_rm`；权重转换对 `w4a8_rm` 只重排 scale、权重原样返回；`w13_up_first` 参数；缓冲区参数 `slot`：扩展的状态是静态的，一个进程里每多一种 MoE 形状就占一个 slot，各加载一份扩展（`_s1` 后缀），主模型用 slot 0、DSPARK draft 模型用 slot 1 |
 | `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe_gin.cu`、`deep_gemm/mega/sm120_fp4_transport.py` | 无改动（`sm120_fp4.py` 按相对路径找它们，一起拷过来）|
+| `deep_gemm/mega/sm120_fp4_relayout.py`（新）、`tests/test_relayout.py` | `PACKED=1`（默认关，未做端到端测试）用：FlashInfer 行主序权重与 kernel 的 packed `w4a8` 布局互转 |
+| `tests/bench_real_routing.py`（新）| 用 SGLang verify 步记录的真实路由回放 kernel，冷 L2，按最慢 rank 计时（文件头有命令）|
 | `tests/test_mega_moe_sm120_fp4.py` | `w4a8_rm` 额外测 `up_first=True`：`torchrun --nproc_per_node=8 kernel/tests/test_mega_moe_sm120_fp4.py verify w4a8_rm`；形状 `dsv41` / `dsv41_draft`；`two_slots w4a8_rm`：主模型和 draft 两种形状在一个进程的 slot 0 / 1 上，直接跑和 CUDA graph 里各跑一遍 |
 
 `kernel/` 来自本仓库 `39b07dc`（`sm120_fp4*` 四个文件和测试）加上表中改动。
@@ -41,6 +43,32 @@ curl -s localhost:30041/generate -H 'Content-Type: application/json' \
 docker rm -f dsv41_sglang                        # 停掉
 ```
 
+### 两台机器，EP16，主模型 MoE 全走 FlashInfer Cake（最快）
+
+两台 8 卡机器（测试用 .6 + .1，CX8aaS），TP16 / DP16 attention / EP16。主模型的 MoE（prefill 和 decode，包括 CUDA graph）
+全部走 FlashInfer 的 Cake SM120 MegaMoE，DSPARK draft 模型的 MoE 仍走本仓库 kernel。另外需要：
+
+- FlashInfer main 的源码（含子模块），测试用 commit `82866b5`，两台机器同一路径（`FI_DIR`），启动时装进容器，JIT 缓存在 `FI_CACHE`；
+- 两台机器之间 `bond0`（`IFNAME=` 可改）互通，node rank 0 的 29661 端口（`DIST_PORT=` 可改）对另一台开放；
+- 模型在两台机器上同一路径。
+
+```bash
+FI=/path/flashinfer   # git clone --recursive https://github.com/flashinfer-ai/flashinfer.git && git -C flashinfer checkout 82866b5
+E="MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 CAKE=1 FI_DIR=$FI NNODES=2 MASTER=10.6.142.6"
+# 两台同时起，node rank 0 先
+env $E NODE_RANK=0 bash launch.sh --mem-fraction-static 0.66   # 在 10.6.142.6 上
+env $E NODE_RANK=1 bash launch.sh --mem-fraction-static 0.66   # 在 10.6.142.1 上
+# 等 node rank 0 的 curl localhost:30041/health 返回 200（约 10 分钟），然后在 node rank 0 上：
+docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 --port 30041 --num-questions 1319 --parallel 256
+DP=16 OTHER_HOSTS=10.6.142.1 CLIENT_DIR=/path/nvidia_decode_client_20261111 DATA=/path/public_pg19_all.jsonl.gz bash bench_bs16.sh
+```
+
+- `EPLB=1` 在 `NNODES=2` 时用 `eplb_map_r16_ep16.pt`（`{'logical_count'}`，同一个 decode bench 上统计），384 个专家加 16 个副本，每卡 25 个。
+- `CAKE_MAX_TOKENS` 默认 2048，即 SGLang 每 rank 的 prefill 分块（`--chunked-prefill-size` = 2048 × 16）；设到 16384 时 EP8 上 Cake 的通信缓冲区分配（`ncclMemAlloc`）失败。
+- `--mem-fraction-static 0.66`：EP16 时 Cake 和 NCCL 的缓冲区约占 14 GB 显存，0.8 / 0.76 会在 indexer 处 OOM；KV 池仍远大于测试所需。
+- 多机时 engram 表每台机器一份（各机 local rank 0 建共享内存，本机 rank 分摊加载）。
+- 测试时间：服务起来约 10 分钟，gsm8k 约 2 分钟，decode bench 约 25 分钟（预热占大部分）。
+
 ## SGLang 版本
 
 公开镜像 `lmsysorg/sglang:v0.5.22-cu130`，SGLang commit `baa9befa381511cd4d56f83980951e5a45fffc6d`（0.5.22）。
@@ -54,6 +82,8 @@ docker rm -f dsv41_sglang                        # 停掉
 | `models/deepseek_v4.py` | `_run_moe_ffn_dp_sync` 开头：`use_sm120_mega_moe` 为真时直接 `forward_mega_moe`，跳过 DP gather / scatter（kernel 自己做 EP 分发和合并）|
 | `layers/moe/mega_moe.py` | SM120 分支：`is_mega_moe_experts_ready` 认 SM120；`run_mega_routed_experts` 在 SM120 上调 `run_sm120_mega_routed` |
 | `layers/moe/mega_moe_sm120.py`（新文件）| 是否走 kernel（每个 rank 一次调用的 token 数 ≤ 128，所有 DP rank 统一判断；CUDA graph 按 capture 的批大小）、建缓冲区（每种 MoE 形状一个 slot：主模型 384 专家 top-6 是 slot 0，DSPARK draft 模型 128 专家 top-3 是 slot 1）、选传输方式、调 kernel |
+| `layers/engram.py` | 多机：engram 主机表按机器各建一份（每台机器 local rank 0 建 memfd，本机其他 rank 打开它；行按本机 rank 分摊加载）。原来只有全局 rank 0 建，另一台机器打不开 |
+| `layers/moe/mega_moe_sm120.py`（Cake 部分）| `SGLANG_SM120_CAKE_ALL=1`（`CAKE=1`）：主模型的 MoE 调用都走 FlashInfer `MoEEpLayer`；加载时 W13 按 Cake 要求原地交错 gate/up 行，scale 另存一份 Cake 布局；CUDA graph capture 时用 `stage_inputs` + `compute_staged`（各 rank 批大小一致，不做路由 all-gather、不同步主机）|
 | `layers/quantization/mxfp4_flashinfer_cutlass_moe.py` | 加载权重时给 kernel 生成一份 UE8M0 scale；FP4 权重和 FlashInfer 共用一份 |
 | `multimodal/dsv41/vl_routing.py` | EPLB：DSV4.1 的 router 走 `vision_topk`，上游只在 MegaMoE a2a 后端时把逻辑专家号换成物理专家号；`--moe-a2a-backend none` 时也换（不换则 gsm8k 掉到 0.02）|
 | `models/deepseek_v2.py` | EPLB：冗余专家只加给主模型，DSPARK draft（128 专家）不加；`vision_topk` 传 `expert_location_dispatch_info` |
@@ -136,6 +166,19 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 测完换 `MEGA=0` 起基线再测一遍做对比（先 `docker rm -f dsv41_sglang`）。
 
 ## 结果
+
+两台机器 EP16（.6 + .1，`lsa_where_reachable` + 8 网卡，EPLB 16 个冗余专家，`DENSE_OPT=1`）：每 rank BS16，全局 256 条，
+每 rank 平均输入 100K，其余与下表客户端设置相同，缓存命中 99.87%。两列同一天、同两台机器、同一测法。
+
+| | EP16，主模型 MoE 走本仓库 kernel | EP16，主模型 MoE 全走 Cake（最快）|
+|---|---|---|
+| TPOT P50 / 平均 / P95 (ms) | 31.7 / 31.6 / 42.3 | **30.9 / 31.0 / 40.4** |
+| 全部输出 tok/s（16 卡）| 8461 | **8791** |
+| 接受长度 / draft 接受率 | 2.42 / 28.46% | 2.39 / 27.77% |
+
+Cake 这一列 gsm8k（1319 题，256 并发）0.901。
+
+单机 EP8：
 
 客户端：decode SSE bench（mode 4，pg19 真实文本，每 rank 平均输入 100K，输出 1100，BS16 每 rank，全局 128 条，稳态窗口 1 s，
 严格检查全部通过，缓存命中 99.87%）。同一行两列在同一机型上测。

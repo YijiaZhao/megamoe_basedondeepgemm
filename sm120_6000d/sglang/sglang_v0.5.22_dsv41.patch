@@ -215,6 +215,65 @@ index ea90f9a..d01fd56 100644
 +        // d.ratio,
 +        -1
      ).to(torch.int32)
+diff --git a/python/sglang/srt/layers/engram.py b/python/sglang/srt/layers/engram.py
+index 71fc553..dffacf5 100644
+--- a/python/sglang/srt/layers/engram.py
++++ b/python/sglang/srt/layers/engram.py
+@@ -12,6 +12,7 @@ import functools
+ import glob
+ import logging
+ import mmap
++import socket
+ import os
+ import re
+ import time
+@@ -675,20 +676,31 @@ class _HostTable:
+         self.device_ptr = _registered_device_ptr(self.bytes.data_ptr())
+ 
+     def _open_shared_fd(self, nbytes: int, name: str) -> int:
++        # One copy per host: the lowest rank of each host owns the memfd and the
++        # host's ranks fill it together (local_rank / local_size split the rows).
++        hosts = [None] * self.group.world_size
++        torch.distributed.all_gather_object(
++            hosts, socket.gethostname(), group=self.group.cpu_group
++        )
++        me = self.group.rank_in_group
++        local = [r for r, h in enumerate(hosts) if h == hosts[me]]
++        self.local_rank, self.local_size = local.index(me), len(local)
+         owner = None
+-        if self.group.rank_in_group == 0:
++        if self.local_rank == 0:
+             fd = os.memfd_create(name, 0)
+             os.ftruncate(fd, nbytes)
+             owner = (os.getpid(), fd)
+-        pid, owner_fd = self.group.broadcast_object(owner, src=0)
+-        if self.group.rank_in_group == 0:
++        owners = [None] * self.group.world_size
++        torch.distributed.all_gather_object(owners, owner, group=self.group.cpu_group)
++        if self.local_rank == 0:
+             return fd
++        pid, owner_fd = owners[local[0]]
+         try:
+             return os.open(f"/proc/{pid}/fd/{owner_fd}", os.O_RDWR)
+         except OSError as e:
+             raise RuntimeError(
+-                "engram host table: cannot open rank 0's memfd through /proc; the "
+-                "TP ranks must share a PID namespace"
++                "engram host table: cannot open this host's first rank's memfd through "
++                "/proc; the TP ranks of one host must share a PID namespace"
+             ) from e
+ 
+     def _collapse(self, tries: int = 3) -> None:
+@@ -810,6 +822,9 @@ class EngramEmbedding(nn.Module):
+     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+         rows = slice(self.row_start, self.row_start + self.rows)
+         if self._shared:
++            # Every host has its own copy: split the rows over this host's ranks.
++            n, t = loaded_weight.shape[0], self.host_table
++            rows = slice(n * t.local_rank // t.local_size, n * (t.local_rank + 1) // t.local_size)
+             param.data[rows].copy_(loaded_weight[rows])
+         else:
+             param.data.copy_(loaded_weight[rows])
 diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 index 1c09781..e59f9f8 100644
 --- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
@@ -287,10 +346,10 @@ index 20d03d8..11c4e46 100644
          envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 diff --git a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/layers/moe/mega_moe_sm120.py
 new file mode 100644
-index 0000000..864fdcd
+index 0000000..ad51ad9
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/mega_moe_sm120.py
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,362 @@
 +# Copyright 2023-2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -314,7 +373,12 @@ index 0000000..864fdcd
 +kernel that quantizes them, pushes them over PCIe P2P to the experts' ranks, runs
 +FC1 + SwiGLU + FC2 there and combines the partials back here. Larger calls take
 +the configured path. The kernel reads the FP4 weights FlashInfer holds (the
-+checkpoint's row-major layout) and keeps its own copy of the UE8M0 scales. The
++checkpoint's row-major layout) and keeps its own copy of the UE8M0 scales. With SGLANG_SM120_MEGA_MOE_PACKED=1 the main
++model's weights move to the kernel's packed 'w4a8' layout at load (in place, ~12% faster decode MoE); FlashInfer's
++calls then read a layer's row-major weights rebuilt into one shared scratch buffer (~1.4 ms per layer). With SGLANG_SM120_CAKE_PREFILL=1 the main model's
++larger calls (up to SGLANG_SM120_CAKE_MAX_TOKENS per rank) run FlashInfer's Cake SM120 MegaMoE instead (the moe_ep
++backend sm120_mxfp4_mxfp8_bf16_cake; needs FlashInfer main): its W2 is FlashInfer's, its interleaved W13 is rebuilt
++per call into one shared scratch buffer and its scales are copied at load. The
 +module `deep_gemm/mega/sm120_fp4.py` is loaded by path from
 +SGLANG_SM120_MEGA_MOE_DIR (a megamoe_basedondeepgemm checkout); its torch
 +extension builds on first use.
@@ -325,6 +389,7 @@ index 0000000..864fdcd
 +import importlib.util
 +import logging
 +import os
++import sys
 +from typing import Optional
 +
 +import torch
@@ -334,10 +399,118 @@ index 0000000..864fdcd
 +logger = logging.getLogger(__name__)
 +
 +_FMT = "w4a8_rm"
++_PACKED_FMT = "w4a8"
++_SCRATCH: dict = {}  # (W13 shape, W2 shape) -> row-major scratch for FlashInfer's calls on packed layers
 +_LOGGED = set()
 +_SLOTS: dict = {}  # (experts, top-k) -> buffer slot, in build order (the main model, then a draft model's MoE)
 +_MODULE = None
 +_BUFFER: dict = {}
++_CAKE: dict = {}  # "layer": the Cake MoEEpLayer (one workspace for all layers), W13 shape -> interleaved scratch
++
++
++def _cake_enabled() -> bool:
++    return os.environ.get("SGLANG_SM120_CAKE_PREFILL", "0") == "1"
++
++
++def _cake_all() -> bool:
++    return os.environ.get("SGLANG_SM120_CAKE_ALL", "0") == "1"
++
++
++def _cake_max_tokens() -> int:
++    return int(os.environ.get("SGLANG_SM120_CAKE_MAX_TOKENS", "16384"))
++
++
++def _build_cake_weights(experts, s13: torch.Tensor, s2: torch.Tensor, w13_up_first: bool) -> None:
++    """Cake's kernel-layout weights of this layer: W2 is FlashInfer's (same row-major bytes), W1 (gate/up rows
++    interleaved by 8) a shared scratch filled per call, the scales a packed copy made now."""
++    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import cake_weights as cw
++
++    w13, w2 = experts.w13_weight.data.view(torch.uint8), experts.w2_weight.data.view(torch.uint8)
++    L, H, I = w13.shape[0], w2.shape[1], w2.shape[2] * 2
++    perm = cw.gate_up_interleave_index(I).to(w13.device)  # rows of [gate; up]
++    if w13_up_first:
++        perm = (perm + I) % (2 * I)
++    key = tuple(w13.shape)
++    if _cake_all():  # Cake serves every call: interleave W13 once, in place
++        w13.copy_(w13.index_select(1, perm))
++    elif key not in _CAKE:
++        _CAKE[key] = torch.empty_like(w13)
++    w1_sf = cw.pack_scales_kblock_major(s13.index_select(1, perm))
++    w2_sf = cw.pack_scales_kblock_major(s2)
++    w1_b8, w2_b8 = cw._noshared_operands(w13.device, H, I)
++    filler = torch.tensor(cw.NOSHARED_SCALE_FILL_WORD, dtype=torch.int64).to(torch.int32)
++    w1_shared_sf = filler.expand(H // 128, 2 * I).to(w13.device).contiguous().view(torch.uint32)
++    w2_shared_sf = filler.expand(I // 128, H).to(w13.device).contiguous().view(torch.uint32)
++    tw = cw.TransformedCakeMegaWeights(
++        w1_fp4=w13 if _cake_all() else _CAKE[key],
++        w1_sfb=cw.scale_vector_layout(torch.cat([w1_sf, w1_shared_sf], dim=0)),
++        w2_fp4=w2,
++        w2_sfb=cw.scale_vector_layout(torch.cat([w2_sf, w2_shared_sf], dim=0)),
++        w1_b8=w1_b8,
++        w2_b8=w2_b8,
++        hidden_size=H,
++        intermediate_size=I,
++        local_experts=L,
++        has_shared_expert=False,
++    )
++    experts.mega_sm120_cake = (tw, perm)
++
++
++def _cake_layer(ep_group, tw, num_experts: int, top_k: int):
++    layer = _CAKE.get("layer")
++    if layer is None:
++        import torch.distributed as dist
++        from flashinfer.moe_ep import BootstrapConfig, FleetParams, MegaConfig, MoEEpLayer
++        from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_config import (
++            Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
++        )
++
++        table = os.environ.get("SGLANG_SM120_CAKE_TABLE", "all_gin")
++        logger.info("SM120 Cake MegaMoE: EP%d, %d experts / top-%d, %d tokens per rank, table %s",
++                    dist.get_world_size(ep_group), num_experts, top_k, _cake_max_tokens(), table)
++        layer = MoEEpLayer(
++            bootstrap=BootstrapConfig(world_size=dist.get_world_size(ep_group), rank=dist.get_rank(ep_group),
++                                      device=torch.cuda.current_device(), process_group=ep_group),
++            fleet_params=FleetParams(num_experts=num_experts, max_tokens_per_rank=_cake_max_tokens(),
++                                     token_hidden_size=tw.hidden_size),
++            weights=None,
++            backend=MegaConfig(
++                megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(
++                    intermediate_size=tw.intermediate_size, top_k=top_k, swiglu_limit=10, transport_table=table),
++                quantize_input=True,
++                transformed_weights=tw,
++            ),
++        )
++        _CAKE["layer"] = layer
++    layer._transformed = tw  # one workspace, this layer's weights (descriptors cached per weights object)
++    return layer
++
++
++def _run_cake(experts, hidden_states, topk_ids, topk_weights, ep_group, num_tokens, top_k):
++    from flashinfer.moe_ep import MoEEpTensors
++
++    tw, perm = experts.mega_sm120_cake
++    if not _cake_all():
++        torch.index_select(experts.w13_weight.data.view(torch.uint8), 1, perm, out=tw.w1_fp4)
++    layer = _cake_layer(ep_group, tw, experts.num_experts, top_k)
++    n = max(num_tokens, 1)  # a rank without tokens still joins the collective call, with one unrouted row
++    if num_tokens == 0:
++        hs = hidden_states.new_zeros((1, tw.hidden_size))
++        ids = torch.full((1, top_k), -1, dtype=torch.int64, device=hidden_states.device)
++        w = torch.zeros((1, top_k), dtype=torch.float32, device=hidden_states.device)
++    else:
++        hs = hidden_states[:num_tokens].contiguous()
++        ids = topk_ids[:num_tokens].to(torch.int64).contiguous()
++        w = topk_weights[:num_tokens].float().contiguous()
++    y = torch.empty((n, tw.hidden_size), dtype=torch.bfloat16, device=hidden_states.device)
++    from sglang.srt.model_executor.runner import get_is_capture_mode
++
++    if get_is_capture_mode():  # rank-uniform bucket: no routing all-gather, no host sync
++        layer.stage_inputs(MoEEpTensors(hidden_states=hs, topk_ids=ids, topk_weights=w), compile_tokens_per_rank=n)
++        layer.compute_staged(output=y)
++    else:
++        layer(MoEEpTensors(hidden_states=hs, topk_ids=ids, topk_weights=w, output=y))
++    return y[:num_tokens]
 +
 +
 +def sm120_mega_moe_enabled() -> bool:
@@ -351,9 +524,23 @@ index 0000000..864fdcd
 +        path = os.path.join(root, "deep_gemm", "mega", "sm120_fp4.py")
 +        spec = importlib.util.spec_from_file_location("sm120_fp4", path)
 +        module = importlib.util.module_from_spec(spec)
++        sys.modules["sm120_fp4"] = module  # sm120_fp4_relayout imports it by this name
 +        spec.loader.exec_module(module)
 +        _MODULE = module
 +    return _MODULE
++
++
++def _relayout():
++    root = os.environ.get("SGLANG_SM120_MEGA_MOE_DIR", "/opt/sm120_megamoe")
++    if "sm120_fp4_relayout" not in sys.modules:
++        sm120_fp4()
++        spec = importlib.util.spec_from_file_location(
++            "sm120_fp4_relayout", os.path.join(root, "deep_gemm", "mega", "sm120_fp4_relayout.py")
++        )
++        module = importlib.util.module_from_spec(spec)
++        sys.modules["sm120_fp4_relayout"] = module
++        spec.loader.exec_module(module)
++    return sys.modules["sm120_fp4_relayout"]
 +
 +
 +def _max_tokens_per_rank() -> int:
@@ -378,7 +565,8 @@ index 0000000..864fdcd
 +        use = hidden_states.shape[0] <= _max_tokens_per_rank()
 +    else:
 +        global_num_tokens = get_dp_global_num_tokens()
-+        use = bool(global_num_tokens) and max(global_num_tokens) <= _max_tokens_per_rank()
++        limit = _cake_max_tokens() if getattr(moe.experts, "mega_sm120_cake", None) is not None else _max_tokens_per_rank()
++        use = bool(global_num_tokens) and max(global_num_tokens) <= limit
 +    key = (use, moe.experts.num_experts)
 +    if key not in _LOGGED:  # once per process, path and MoE shape
 +        _LOGGED.add(key)
@@ -410,11 +598,42 @@ index 0000000..864fdcd
 +    )
 +    experts.mega_sm120_scales = (ws13, ws2)
 +    experts.mega_sm120_up_first = w13_up_first
++    experts.mega_sm120_fmt = _FMT
++    if _cake_enabled() and _SLOTS[(experts.num_experts, experts.top_k)] == 0:
++        _build_cake_weights(experts, s13, s2, w13_up_first)
 +    experts._mega_moe_weights_built = True
 +
 +
-+def _get_buffer(group, num_experts, num_max_tokens_per_rank, top_k, hidden, inter):
-+    key = (id(group), num_experts, num_max_tokens_per_rank, top_k, hidden, inter)
++def pack_sm120_mega_moe_weights(experts) -> None:
++    """At load, after FlashInfer's processing (SGLANG_SM120_MEGA_MOE_PACKED=1, the main model's MoE only): the weights
++    to the packed 'w4a8' layout in place (its scales are the 'w4a8_rm' + up-first ones already built), and the shared
++    row-major scratch FlashInfer's calls read, allocated now, before the KV cache takes the free memory."""
++    if os.environ.get("SGLANG_SM120_MEGA_MOE_PACKED", "0") != "1" or getattr(experts, "mega_sm120_packed", False):
++        return
++    if _SLOTS.get((experts.num_experts, experts.top_k)) != 0 or not experts.mega_sm120_up_first:
++        return
++    w13, w2 = experts.w13_weight.data.view(torch.uint8), experts.w2_weight.data.view(torch.uint8)
++    _relayout().to_packed_(w13, w2)
++    key = (tuple(w13.shape), tuple(w2.shape))
++    if key not in _SCRATCH:
++        _SCRATCH[key] = (torch.empty_like(w13), torch.empty_like(w2))
++    experts.mega_sm120_fmt = _PACKED_FMT
++    experts.mega_sm120_packed = True
++
++
++def sm120_row_major_weights(experts):
++    """FlashInfer's (W13, W2) for a call on this layer: the weights themselves, or for a packed layer its row-major
++    weights rebuilt into the shared scratch (valid until the next packed layer's call)."""
++    if not getattr(experts, "mega_sm120_packed", False):
++        return experts.w13_weight, experts.w2_weight
++    w13, w2 = experts.w13_weight.data, experts.w2_weight.data
++    s13, s2 = _SCRATCH[(tuple(w13.view(torch.uint8).shape), tuple(w2.view(torch.uint8).shape))]
++    _relayout().to_row_major(w13.view(torch.uint8), w2.view(torch.uint8), s13, s2)
++    return s13.view(w13.dtype), s2.view(w2.dtype)
++
++
++def _get_buffer(group, num_experts, num_max_tokens_per_rank, top_k, hidden, inter, fmt=_FMT):
++    key = (id(group), num_experts, num_max_tokens_per_rank, top_k, hidden, inter, fmt)
 +    buf = _BUFFER.get(key)
 +    if buf is None:
 +        # the kernel's work-item table holds EL + W * TCAP * top-k / 8 tiles (kMaxTiles)
@@ -430,10 +649,10 @@ index 0000000..864fdcd
 +        # p2p (default) or an NCCL-window transport of sm120_fp4.TRANSPORTS (e.g. lsa_where_reachable on CX8aaS hosts)
 +        transport = os.environ.get("SGLANG_SM120_MEGA_MOE_TRANSPORT", "p2p")
 +        slot = _SLOTS[num_experts, top_k]
-+        logger.info("SM120 MegaMoE buffer: EP%d, %d experts / top-%d (slot %d), transport %s",
-+                    world, num_experts, top_k, slot, transport)
++        logger.info("SM120 MegaMoE buffer: EP%d, %d experts / top-%d (slot %d), transport %s, format %s",
++                    world, num_experts, top_k, slot, transport, fmt)
 +        buf = sm120_fp4().Sm120Fp4MegaMoeBuffer(
-+            group, _FMT, num_experts, num_max_tokens_per_rank, top_k, hidden, inter, transport=transport, slot=slot
++            group, fmt, num_experts, num_max_tokens_per_rank, top_k, hidden, inter, transport=transport, slot=slot
 +        )
 +        _BUFFER[key] = buf
 +    return buf
@@ -453,6 +672,16 @@ index 0000000..864fdcd
 +    activation_clamp: Optional[float],
 +    routed_scaling_factor: float,
 +) -> torch.Tensor:
++    if getattr(experts, "mega_sm120_cake", None) is not None:
++        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
++        from sglang.srt.model_executor.runner import get_is_capture_mode
++
++        if _cake_all() or (not get_is_capture_mode() and max(get_dp_global_num_tokens()) > _max_tokens_per_rank()):
++            assert activation_clamp == 10, activation_clamp  # the Cake build clamps SwiGLU at 10
++            y = _run_cake(experts, hidden_states, topk_ids, topk_weights, ep_group, num_tokens, top_k)
++            if routed_scaling_factor != 1.0:
++                y.mul_(routed_scaling_factor)
++            return y
 +    buf = _get_buffer(
 +        ep_group,
 +        experts.num_experts,
@@ -460,6 +689,7 @@ index 0000000..864fdcd
 +        top_k,
 +        hidden_size,
 +        intermediate_size,
++        experts.mega_sm120_fmt,
 +    )
 +    y = torch.empty(
 +        (max(num_tokens, 1), hidden_size),
@@ -476,7 +706,7 @@ index 0000000..864fdcd
 +        (experts.w2_weight.data, ws2),
 +        buf,
 +        activation_clamp=activation_clamp,
-+        w13_up_first=experts.mega_sm120_up_first,
++        w13_up_first=experts.mega_sm120_up_first and experts.mega_sm120_fmt == _FMT,
 +    )
 +    y = y[:num_tokens]
 +    if routed_scaling_factor != 1.0:
@@ -529,7 +759,7 @@ index 6fa480b..6bea1f2 100755
          return partial(
              flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
 diff --git a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
-index b8e6ff0..8663873 100644
+index b8e6ff0..775bae6 100644
 --- a/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 +++ b/python/sglang/srt/layers/quantization/mxfp4_flashinfer_cutlass_moe.py
 @@ -153,6 +153,13 @@ class Mxfp4FlashinferCutlassMoEMethod:
@@ -546,6 +776,38 @@ index b8e6ff0..8663873 100644
              from flashinfer import block_scale_interleave
  
              if (
+@@ -225,6 +232,14 @@ class Mxfp4FlashinferCutlassMoEMethod:
+         # SM90 creates full-size interleaved copies; release old layouts per layer.
+         if not self._use_mxfp8_act_scaling:
+             torch.cuda.empty_cache()
++        else:
++            from sglang.srt.layers.moe.mega_moe_sm120 import (
++                pack_sm120_mega_moe_weights,
++                sm120_mega_moe_enabled,
++            )
++
++            if sm120_mega_moe_enabled():
++                pack_sm120_mega_moe_weights(layer)
+ 
+     def apply(
+         self,
+@@ -235,9 +250,14 @@ class Mxfp4FlashinferCutlassMoEMethod:
+             FlashInferCutlassMxfp4MoeQuantInfo,
+         )
+ 
++        w13_weight, w2_weight = layer.w13_weight, layer.w2_weight
++        if getattr(layer, "mega_sm120_packed", False):  # SM120 MegaMoE keeps this layer packed
++            from sglang.srt.layers.moe.mega_moe_sm120 import sm120_row_major_weights
++
++            w13_weight, w2_weight = sm120_row_major_weights(layer)
+         quant_info = FlashInferCutlassMxfp4MoeQuantInfo(
+-            w13_weight=layer.w13_weight,
+-            w2_weight=layer.w2_weight,
++            w13_weight=w13_weight,
++            w2_weight=w2_weight,
+             w13_weight_scale=layer.w13_weight_scale_inv,
+             w2_weight_scale=layer.w2_weight_scale_inv,
+             mxfp4_weight_global_scale=self._mxfp4_weight_global_scale_tensor,
 diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
 index 4255da8..73a39bd 100644
 --- a/python/sglang/srt/models/deepseek_v2.py
