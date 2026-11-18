@@ -52,6 +52,7 @@ public:
         bool strided_pool_debug;
         int l1_task_tiles;
         int l2_task_tiles;
+        int num_experts;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -80,9 +81,11 @@ public:
                           "sm90_nvfp4_mega_moe_h200_fused_impl");
         const std::string kernel_header = fmt::format(
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
+            "#define DG_H20_NUM_EXPERTS {}\n"
             "{}"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
+            args.num_experts,
             get_env<int>("DG_FP4_SPIN_TIMEOUT", 0) != 0 ? "#define DG_FUSED_SPIN_TIMEOUT 1\n" : "",
             kernel_symbol);
         const std::string policy_template_args = fmt::format(
@@ -658,6 +661,7 @@ static void sm90_fp4_h20_fused_mega_moe(
         .strided_pool_debug = strided_pool_debug,
         .l1_task_tiles = l1_task_tiles,
         .l2_task_tiles = l2_task_tiles,
+        .num_experts = num_experts,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,

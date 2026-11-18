@@ -31,6 +31,8 @@ struct SM90FP4H20FusedShape {
     static constexpr int kH200NumSMs = 78;
     static constexpr int kNumRanks = 8;
     static constexpr int kExpertsPerRank = 48;
+    // One node of a two-node EP16: 192 experts over the 8 NVLink ranks.
+    static constexpr int kEP16ExpertsPerRank = 24;
     static constexpr int kTopk = 8;
     static constexpr int kHidden = 3072;
     static constexpr int kIntermediateHidden = 1280;
@@ -49,7 +51,8 @@ struct SM90FP4H20FusedShape {
     constexpr bool is_supported_h200_shape() const noexcept {
         return num_sms == kH200NumSMs &&
             num_ranks == kNumRanks &&
-            num_experts == kExpertsPerRank * kNumRanks &&
+            (num_experts == kExpertsPerRank * kNumRanks ||
+             num_experts == kEP16ExpertsPerRank * kNumRanks) &&
             num_topk == kTopk &&
             hidden == kHidden &&
             intermediate_hidden == kIntermediateHidden;
@@ -90,8 +93,8 @@ select_sm90_nvfp4_h200_fused(
         const SM90FP4H20FusedInput& input) {
     DG_HOST_ASSERT(input.shape().is_supported_h200_shape());
     DG_HOST_ASSERT(
-        input.num_experts_per_rank ==
-        SM90FP4H20FusedShape::kExpertsPerRank);
+        input.num_experts_per_rank == SM90FP4H20FusedShape::kExpertsPerRank ||
+        input.num_experts_per_rank == SM90FP4H20FusedShape::kEP16ExpertsPerRank);
     DG_HOST_ASSERT(input.num_experts ==
                    input.num_experts_per_rank * input.num_ranks);
     DG_HOST_ASSERT(input.num_max_tokens_per_rank > 0);

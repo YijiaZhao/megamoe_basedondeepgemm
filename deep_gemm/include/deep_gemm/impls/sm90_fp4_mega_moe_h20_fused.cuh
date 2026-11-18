@@ -550,7 +550,12 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         const uint32_t* __restrict__ fe_keys) {
     constexpr uint32_t kHidden = 3072;
     constexpr uint32_t kIntermediateHidden = 1280;
-    constexpr uint32_t kNumExperts = 384;
+    // Experts across the kNumRanks NVLink ranks of this launch: 384 (EP8), or 192 when
+    // the launch is one node of a two-node EP16 (24 per rank; see deep_gemm/mega/ep16.py).
+#ifndef DG_H20_NUM_EXPERTS
+#define DG_H20_NUM_EXPERTS 384
+#endif
+    constexpr uint32_t kNumExperts = DG_H20_NUM_EXPERTS;
     constexpr uint32_t kNumTopk = 8;
     constexpr uint32_t BLOCK_K = 128;
     constexpr uint32_t kNumDispatchThreads = 64;
