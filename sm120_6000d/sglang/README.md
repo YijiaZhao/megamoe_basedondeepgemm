@@ -8,11 +8,12 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 
 | `kernel/` 下的文件 | 相对仓库同名文件的改动 |
 |---|---|
-| `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变；路由计数按 epoch 奇偶双缓冲（与仓库主 kernel 相同）。`w4a8_rm` 的 item：激活值按 K 分段用 `cp.async` 暂存到共享内存（item 的 8 个 warp 共用，只读一次，提前一段预取），每 rank ≥ 32 token 时一个 item 32 个 token、否则 16 个，item 里没有 token 的 8-token 子块跳过 |
-| `deep_gemm/mega/sm120_fp4.py` | `FORMATS` 加 `w4a8_rm`；权重转换对 `w4a8_rm` 只重排 scale、权重原样返回；`w13_up_first` 参数；缓冲区参数 `slot`：扩展的状态是静态的，一个进程里每多一种 MoE 形状就占一个 slot，各加载一份扩展（`_s1` 后缀），主模型用 slot 0、DSPARK draft 模型用 slot 1 |
+| `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变；路由计数按 epoch 奇偶双缓冲（与仓库主 kernel 相同）。`w4a8_rm` 的 item：激活值按 K 分段用 `cp.async` 暂存到共享内存（item 的 8 个 warp 共用，只读一次，提前一段预取），每 rank ≥ 32 token 时一个 item 32 个 token、否则 16 个，item 里没有 token 的 8-token 子块跳过。可选的 kernel 内路由（`Route`）：传入 gate logits 时，CTA b 用一个 warp 算 token b 的路由（sqrtsoftplus、偏置 / 图像 token 的 `bias_vl`、top-k、归一化、缩放、EPLB 选副本 `t % n`，与 SGLang `moe_fused_gate` 的专家选择一致），写进 topk 缓冲区后其余 CTA 再开始分发 |
+| `deep_gemm/mega/sm120_fp4.py` | `fp4_mega_moe_sm120` 的 `router_logits` 等关键字参数（kernel 内路由）；`FORMATS` 加 `w4a8_rm`；权重转换对 `w4a8_rm` 只重排 scale、权重原样返回；`w13_up_first` 参数；缓冲区参数 `slot`：扩展的状态是静态的，一个进程里每多一种 MoE 形状就占一个 slot，各加载一份扩展（`_s1` 后缀），主模型用 slot 0、DSPARK draft 模型用 slot 1 |
 | `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe_gin.cu`、`deep_gemm/mega/sm120_fp4_transport.py` | 无改动（`sm120_fp4.py` 按相对路径找它们，一起拷过来）|
 | `deep_gemm/mega/sm120_fp4_relayout.py`（新）、`tests/test_relayout.py` | `PACKED=1`（默认关，未做端到端测试）用：FlashInfer 行主序权重与 kernel 的 packed `w4a8` 布局互转 |
 | `tests/bench_real_routing.py`（新）| 用 SGLang verify 步记录的真实路由回放 kernel，冷 L2，按最慢 rank 计时（文件头有命令）|
+| `tests/bench_router_fused.py`（新）| kernel 内路由对 SGLang 路由（gate GEMM + `moe_fused_gate` + EPLB 映射）+ kernel：路由是否一致、输出差异、两者整层时间（文件头有命令）|
 | `tests/test_mega_moe_sm120_fp4.py` | `w4a8_rm` 额外测 `up_first=True`：`torchrun --nproc_per_node=8 kernel/tests/test_mega_moe_sm120_fp4.py verify w4a8_rm`；形状 `dsv41` / `dsv41_draft`；`two_slots w4a8_rm`：主模型和 draft 两种形状在一个进程的 slot 0 / 1 上，直接跑和 CUDA graph 里各跑一遍 |
 
 `kernel/` 来自本仓库 `39b07dc`（`sm120_fp4*` 四个文件和测试）加上表中改动。
@@ -36,7 +37,7 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 git clone https://github.com/YijiaZhao/megamoe_basedondeepgemm.git
 cd megamoe_basedondeepgemm/sm120_6000d/sglang
 docker pull lmsysorg/sglang:v0.5.22-cu130
-MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # 最快的配置（CX8aaS 机型，EPLB）；容器名 dsv41_sglang
+MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 FUSED_ROUTER=1 bash launch.sh   # 最快的配置（CX8aaS 机型，EPLB，kernel 内路由）；容器名 dsv41_sglang
 docker logs -f dsv41_sglang                      # 等到 "The server is fired up"（约 7 分钟，第一次含 kernel 编译）
 curl -s localhost:30041/generate -H 'Content-Type: application/json' \
   -d '{"text":"1+1=","sampling_params":{"max_new_tokens":8,"temperature":0}}'
@@ -80,7 +81,7 @@ DP=16 OTHER_HOSTS=10.6.142.1 CLIENT_DIR=/path/nvidia_decode_client_20261111 DATA
 |---|---|
 | `layers/attention/dsv4/v41_indexer/__init__.py` | 启动修复：`is_sm100_or_newer` 由 `>= 10` 改为 `== 10`，SM120 走 torch indexer（SM120 没有 SM100 的 DeepGEMM indexer kernel）。不用 MegaMoE 也需要 |
 | `models/deepseek_v4.py` | `_run_moe_ffn_dp_sync` 开头：`use_sm120_mega_moe` 为真时直接 `forward_mega_moe`，跳过 DP gather / scatter（kernel 自己做 EP 分发和合并）|
-| `layers/moe/mega_moe.py` | SM120 分支：`is_mega_moe_experts_ready` 认 SM120；`run_mega_routed_experts` 在 SM120 上调 `run_sm120_mega_routed` |
+| `layers/moe/mega_moe.py` | SM120 分支：`is_mega_moe_experts_ready` 认 SM120；`run_mega_routed_experts` 在 SM120 上调 `run_sm120_mega_routed`；`SGLANG_SM120_FUSED_ROUTER=1` 时算完 gate logits 不再调 `vision_topk` / `topk` 和 EPLB 映射，把 logits 交给 kernel 路由 |
 | `layers/moe/mega_moe_sm120.py`（新文件）| 是否走 kernel（每个 rank 一次调用的 token 数 ≤ 128，所有 DP rank 统一判断；CUDA graph 按 capture 的批大小）、建缓冲区（每种 MoE 形状一个 slot：主模型 384 专家 top-6 是 slot 0，DSPARK draft 模型 128 专家 top-3 是 slot 1）、选传输方式、调 kernel |
 | `layers/engram.py` | 多机：engram 主机表按机器各建一份（每台机器 local rank 0 建 memfd，本机其他 rank 打开它；行按本机 rank 分摊加载）。原来只有全局 rank 0 建，另一台机器打不开 |
 | `layers/moe/mega_moe_sm120.py`（Cake 部分）| `SGLANG_SM120_CAKE_ALL=1`（`CAKE=1`）：主模型的 MoE 调用都走 FlashInfer `MoEEpLayer`；加载时 W13 按 Cake 要求原地交错 gate/up 行，scale 另存一份 Cake 布局；CUDA graph capture 时用 `stage_inputs` + `compute_staged`（各 rank 批大小一致，不做路由 all-gather、不同步主机）|
@@ -128,6 +129,7 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash lau
 | `SGLANG_SM120_MEGA_MOE` | `1` | 打开 kernel |
 | `SGLANG_SHARED_EXPERT_TP1` | `1` | 必需：shared expert 在本 rank 完整计算（kernel 只算本 rank 的 token）|
 | `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` | `128` | 每 rank token 上限，也是缓冲区大小 |
+| `SGLANG_SM120_FUSED_ROUTER` | `0` / `1`（`FUSED_ROUTER=1`）| kernel 内路由（不用于哈希层、Cake、fused shared expert）|
 | `SGLANG_SM120_MEGA_MOE_TRANSPORT` | `p2p` / `lsa_where_reachable` | 传输方式，见下节；其余可选值见 `kernel/deep_gemm/mega/sm120_fp4.py` 的 `TRANSPORTS` |
 | `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE` | `1` | 上游开关（基线也开）：engram 表放主机内存，否则 `mem-fraction-static 0.8` 放不下 KV |
 | `SGLANG_SM120_INDEXER_GROUP` | `6`（`DENSE_OPT=1`）| verify 每个请求的行数（draft token + 1），分组 indexer；`0` 为原 indexer |
@@ -188,17 +190,17 @@ Cake 这一列 gsm8k（1319 题，256 并发）0.901。
 | .6（CX8aaS）| `lsa_where_reachable` + 8 网卡 | 58.5 / 57.6 / 75.5 | 48.2 / 48.1 / 65.1 | −16.5% | 2332 → 2745 |
 | .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=0` | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 44.3 / 45.6 / 60.6 | −18.7% | 2589 → 3032 |
 | .1（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1` 不含 `b12x`² | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 36.2 / 35.5 / 48.2 | −36.7% | 2589 → 3826 |
-| .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`（默认）³ | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **31.5 / 30.3 / 40.9** | −46.0% | 2589 → **4430** |
+| .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`（默认），`FUSED_ROUTER=1`³ | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **28.6 / 29.1 / 36.9** | −48.1% | 2589 → **4621** |
 | .20（Broadcom）¹ | `p2p` | — / 57.3 / 80.2 | — / 48.8 / 64.7 | −14.8% | 2217 → 2818 |
 
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
 ² 当时 FP8 线性层全走 CUTLASS（`SGLANG_SM120_MXFP8_B12X_MIN_N=0`）。基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。
 每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
-³ 当前 kernel（激活值暂存到共享内存，每 rank ≥ 32 token 用 32-token item）：每步间隔（SSE gap）P50 64.9 ms，接受长度 2.42、
-draft 接受率 28.5%。上一版 kernel 同配置 33.1 / 32.7 / 43.7 ms、3989 tok/s、每步间隔 P50 69.5 ms；FlashInfer Cake（主模型
+³ 当前 kernel（激活值暂存到共享内存，每 rank ≥ 32 token 用 32-token item），kernel 内路由：每步间隔（SSE gap）P50 63.9 ms，
+接受长度 2.39、draft 接受率 27.9%。不开 kernel 内路由（`FUSED_ROUTER=0`）31.5 / 30.3 / 40.9 ms、4430 tok/s、64.9 ms。上一版 kernel 同配置 33.1 / 32.7 / 43.7 ms、3989 tok/s、每步间隔 P50 69.5 ms；FlashInfer Cake（主模型
 MoE 全走 Cake，`--mem-fraction-static 0.76`）同配置 34.9 / 33.6 / 41.4 ms、4085 tok/s、70.5 ms。
 按 10 步 profile，FP8 GEMM 每步 10.8 → 7.5 ms（`b12x`），整步 72.9 → 69.6 ms，其余部分不变。
 
 精度：gsm8k（1319 题，128 并发）基线 0.907，MegaMoE（主模型 + draft，.6）0.900；开 EPLB：基线 0.917，MegaMoE 0.918；
-EPLB + `DENSE_OPT=1`：不含 `b12x` 0.909，含 `b12x` 0.903，当前 kernel 0.908。
+EPLB + `DENSE_OPT=1`：不含 `b12x` 0.909，含 `b12x` 0.903，当前 kernel 0.908，加 kernel 内路由 0.909。
 逐层对比（同一输入，kernel 对 FlashInfer）：相对误差中位数 1.4%，余弦相似度 ≥ 0.9997。

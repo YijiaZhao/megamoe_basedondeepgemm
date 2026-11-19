@@ -325,17 +325,46 @@ def fp4_mega_moe_sm120(y: torch.Tensor,
                        activation_clamp: Optional[float] = None,
                        tile_tokens: int = 0,
                        stamps: Optional[torch.Tensor] = None,
-                       w13_up_first: bool = False) -> torch.Tensor:
+                       w13_up_first: bool = False,
+                       *,
+                       router_logits: Optional[torch.Tensor] = None,
+                       router_bias: Optional[torch.Tensor] = None,
+                       router_bias_alt: Optional[torch.Tensor] = None,
+                       input_ids: Optional[torch.Tensor] = None,
+                       alt_token_id: int = -1,
+                       logical_to_all_physical: Optional[torch.Tensor] = None,
+                       renormalize: bool = True,
+                       renormalize_epsilon: float = 0.0,
+                       apply_routed_scaling: bool = False,
+                       routed_scaling_factor: float = 1.0) -> torch.Tensor:
     """EP MegaMoE over the buffer's group. `x` [T, H] bf16 (T <= num_max_tokens_per_rank), `topk_idx` [T, K] global
     expert ids (-1 = skip), `topk_weights` [T, K]; `y` [T, H] bf16 receives the combined output. Weights are this
     rank's experts from `transform_fp4_weights_for_mega_moe_sm120`; 'nvfp4' also takes `nvfp4_global_scales`.
     `tile_tokens`: tokens per work item (8 / 16 / 32; each weight fragment feeds that many tokens), 0 = chosen
     ('w4a8_rm': 32 from 32 tokens per rank, 16 below, a tile skipping its empty sub-tiles; other formats: from the
     expected tokens per local expert). `w13_up_first`: as given to the weight transform ('w4a8_rm').
+    In-kernel router (DeepSeek-V4.1, SGLang's moe_fused_gate with sqrtsoftplus via log1p): with `router_logits`
+    ([T, E] or [slices, T, E] fp32 gate logits, E <= 384 logical experts), the kernel routes first and `topk_idx` /
+    `topk_weights` (int32 / fp32 [T, K], contiguous) receive the routes: score + `router_bias` ranks (`router_bias_alt`
+    for the rows whose int64 `input_ids` equal `alt_token_id`), the weights are renormalized (+ epsilon) and scaled
+    when asked, and `logical_to_all_physical` ([E, R] int32, ascending, -1 padded) maps row t to replica t % n.
     Every rank of the group must call it."""
     assert x.shape[0] <= sym_buffer.num_max_tokens_per_rank
     assert (global_scales is not None) == (sym_buffer.fmt == 'nvfp4')
+    if router_logits is not None:
+        assert topk_idx.dtype == torch.int32 and topk_weights.dtype == torch.float32
+        assert topk_idx.is_contiguous() and topk_weights.is_contiguous()
+        logits = router_logits if router_logits.dim() == 3 else router_logits.unsqueeze(0)
+        sym_buffer.ext.run(x.to(torch.bfloat16).contiguous(), topk_idx, topk_weights, y, l1_weights[0], l1_weights[1],
+                           l2_weights[0], l2_weights[1], global_scales, _clamp(activation_clamp), tile_tokens, stamps,
+                           w13_up_first, logits.float().contiguous(), router_bias.float(),
+                           router_bias_alt.float() if router_bias_alt is not None else None,
+                           input_ids.long() if router_bias_alt is not None else None, int(alt_token_id),
+                           logical_to_all_physical, bool(renormalize), float(renormalize_epsilon),
+                           bool(apply_routed_scaling), float(routed_scaling_factor))
+        return y
     sym_buffer.ext.run(x.to(torch.bfloat16).contiguous(), topk_idx.to(torch.int32).contiguous(),
                        topk_weights.to(torch.float32).contiguous(), y, l1_weights[0], l1_weights[1], l2_weights[0],
-                       l2_weights[1], global_scales, _clamp(activation_clamp), tile_tokens, stamps, w13_up_first)
+                       l2_weights[1], global_scales, _clamp(activation_clamp), tile_tokens, stamps, w13_up_first,
+                       None, None, None, None, -1, None, True, 0.0, False, 1.0)
     return y

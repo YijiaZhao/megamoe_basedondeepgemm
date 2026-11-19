@@ -293,7 +293,7 @@ index 1c09781..e59f9f8 100644
              if not getattr(param, "_sglang_require_global_experts", False):
                  expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
 diff --git a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
-index 20d03d8..11c4e46 100644
+index 20d03d8..6001685 100644
 --- a/python/sglang/srt/layers/moe/mega_moe.py
 +++ b/python/sglang/srt/layers/moe/mega_moe.py
 @@ -163,6 +163,8 @@ def is_mega_moe_experts_ready(experts) -> bool:
@@ -305,20 +305,65 @@ index 20d03d8..11c4e46 100644
      # The SM100 mega kernels exist for compute capability 10.x only.
      return _device_sm // 10 == 10
  
-@@ -267,7 +269,11 @@ def _run_mega_routed(
+@@ -259,6 +261,7 @@ def _run_mega_routed(
+ ) -> torch.Tensor:
+     hidden_size = moe.config.hidden_size
+ 
++    router = None
+     if num_tokens > 0:
+         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+@@ -267,8 +270,19 @@ def _run_mega_routed(
              if forward_batch is not None
              else None
          )
 -        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+-        if (
 +        dispatch_info = (
 +            ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
 +            if not moe.is_nextn
 +            else None
 +        )
-         if (
++        if _device_sm == 120 and num_token_non_padded is None:
++            from sglang.srt.layers.moe.mega_moe_sm120 import sm120_fused_router, sm120_router_args
++
++            if sm120_fused_router(moe):  # the SM120 kernel routes from the logits itself
++                router = sm120_router_args(moe, router_logits, input_ids_global, dispatch_info)
++        if router is not None:
++            topk_ids = topk_weights = None
++        elif (
              not moe.is_hash
              and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
-@@ -338,6 +344,25 @@ def run_mega_routed_experts(
+         ):
+@@ -287,8 +301,9 @@ def _run_mega_routed(
+                 expert_location_dispatch_info=dispatch_info,
+                 **topk_kwargs,
+             )
+-        topk_ids = topk_output.topk_ids
+-        topk_weights = topk_output.topk_weights
++        if router is None:
++            topk_ids = topk_output.topk_ids
++            topk_weights = topk_output.topk_weights
+     else:
+         topk_ids = None
+         topk_weights = None
+@@ -313,6 +328,7 @@ def _run_mega_routed(
+         ),
+         shared_l1_weights=moe.mega_shared_l1_weights,
+         shared_l2_weights=moe.mega_shared_l2_weights,
++        router=router,
+     )
+ 
+ 
+@@ -331,6 +347,7 @@ def run_mega_routed_experts(
+     num_shared_experts: int = 0,
+     shared_l1_weights=None,
+     shared_l2_weights=None,
++    router: Optional[dict] = None,
+ ) -> torch.Tensor:
+     # Rows are this rank's tokens; the returned rows are fully combined.
+     import deep_gemm
+@@ -338,6 +355,26 @@ def run_mega_routed_experts(
      from sglang.srt.runtime_context import get_parallel
  
      ep_group = get_parallel().moe_ep_group.device_group
@@ -340,16 +385,17 @@ index 20d03d8..11c4e46 100644
 +            top_k=top_k,
 +            activation_clamp=activation_clamp,
 +            routed_scaling_factor=routed_scaling_factor,
++            router=router,
 +        )
      num_experts = experts.num_experts
      num_max_tokens_per_rank = (
          envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 diff --git a/python/sglang/srt/layers/moe/mega_moe_sm120.py b/python/sglang/srt/layers/moe/mega_moe_sm120.py
 new file mode 100644
-index 0000000..ad51ad9
+index 0000000..bd55f46
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/mega_moe_sm120.py
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,410 @@
 +# Copyright 2023-2024 SGLang Team
 +# Licensed under the Apache License, Version 2.0 (the "License");
 +# you may not use this file except in compliance with the License.
@@ -543,6 +589,49 @@ index 0000000..ad51ad9
 +    return sys.modules["sm120_fp4_relayout"]
 +
 +
++def sm120_fused_router(moe) -> bool:
++    """SGLANG_SM120_FUSED_ROUTER=1: the kernel routes from the gate logits itself (DeepSeek-V4.1's router: sqrtsoftplus
++    via log1p, correction bias, top-k, renormalize, routed scaling, EPLB 'dynamic'), replacing moe_fused_gate and the
++    EPLB remap. Not for hash layers, fused shared experts, Cake layers or more than 384 experts."""
++    if os.environ.get("SGLANG_SM120_FUSED_ROUTER", "0") != "1" or getattr(moe, "is_hash", False):
++        return False
++    cfg = getattr(getattr(moe, "topk", None), "topk_config", None)
++    return (
++        cfg is not None
++        and cfg.scoring_func == "sqrtsoftplus"
++        and getattr(cfg, "sqrtsoftplus_log1p", False)
++        and getattr(moe, "num_fused_shared_experts", 0) == 0
++        and getattr(moe.experts, "mega_sm120_cake", None) is None
++        and moe.config.n_routed_experts <= 384
++        and moe.gate.e_score_correction_bias is not None
++    )
++
++
++def sm120_router_args(moe, router_logits, input_ids, dispatch_info) -> dict:
++    """The in-kernel router's arguments for this layer, as vision_topk / TopK would route: bias_vl for image tokens
++    (renormalize + 1e-20), else the zero-sum guard; EPLB: the layer's replicas (int32, cached on the layer)."""
++    cfg = moe.topk.topk_config
++    bias_vl = getattr(moe.gate, "e_score_correction_bias_vl", None)
++    l2p = None
++    if dispatch_info is not None:
++        l2p = getattr(moe, "_sm120_l2p", None)
++        if l2p is None:
++            l2p = dispatch_info.partial_logical_to_all_physical_map.to(torch.int32).contiguous()
++            moe._sm120_l2p = l2p
++    return dict(
++        router_logits=router_logits,
++        router_bias=moe.gate.e_score_correction_bias,
++        router_bias_alt=bias_vl if input_ids is not None else None,
++        input_ids=input_ids if bias_vl is not None else None,
++        alt_token_id=int(getattr(moe.config, "image_token_id", -1) or -1),
++        logical_to_all_physical=l2p,
++        renormalize=bool(cfg.renormalize and cfg.top_k > 1),
++        renormalize_epsilon=1e-20 if bias_vl is not None else 0.0,
++        apply_routed_scaling=bool(cfg.apply_routed_scaling_factor_on_output),
++        routed_scaling_factor=float(cfg.routed_scaling_factor or 1.0),
++    )
++
++
 +def _max_tokens_per_rank() -> int:
 +    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
 +
@@ -671,8 +760,12 @@ index 0000000..ad51ad9
 +    top_k: int,
 +    activation_clamp: Optional[float],
 +    routed_scaling_factor: float,
++    router: Optional[dict] = None,
 +) -> torch.Tensor:
-+    if getattr(experts, "mega_sm120_cake", None) is not None:
++    if router is not None:  # the kernel routes: topk_ids / topk_weights are its outputs
++        topk_ids = hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
++        topk_weights = hidden_states.new_empty((num_tokens, top_k), dtype=torch.float32)
++    elif getattr(experts, "mega_sm120_cake", None) is not None:
 +        from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 +        from sglang.srt.model_executor.runner import get_is_capture_mode
 +
@@ -707,6 +800,7 @@ index 0000000..ad51ad9
 +        buf,
 +        activation_clamp=activation_clamp,
 +        w13_up_first=experts.mega_sm120_up_first and experts.mega_sm120_fmt == _FMT,
++        **(router or {}),
 +    )
 +    y = y[:num_tokens]
 +    if routed_scaling_factor != 1.0:

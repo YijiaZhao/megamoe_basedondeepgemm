@@ -6,7 +6,8 @@
 #   MODEL_DIR=/raid/models bash launch.sh                  # MegaMoE, PCIe P2P (Broadcom-switch hosts, e.g. .20)
 #   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable bash launch.sh   # MegaMoE, peers NCCL cannot map for P2P over the NICs (CX8aaS)
 #   MODEL_DIR=/raid/models MEGA=0 bash launch.sh           # baseline: stock FlashInfer MoE (startup fix only)
-#   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # + EPLB, 8 redundant experts (fastest on one host)
+#   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # + EPLB, 8 redundant experts
+#   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 FUSED_ROUTER=1 bash launch.sh   # + the kernel routes (fastest on one host)
 #   two hosts, EP16, every main-model MoE call on FlashInfer's Cake (fastest), on both hosts, node rank 0 first:
 #   MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 CAKE=1 FI_DIR=<FlashInfer checkout> NNODES=2 NODE_RANK=0|1 \
 #     MASTER=<node rank 0's address> bash launch.sh --mem-fraction-static 0.66
@@ -27,6 +28,9 @@
 # EPLB=1: SGLang's EPLB places the main model's experts from eplb_map_r8_ep8.pt (EP8, 384 experts + 8 replicas) or, with
 # NNODES=2, eplb_map_r16_ep16.pt (EP16, + 16 replicas); another
 # placement: EPLB_MAP (host .pt, {'physical_to_logical_map'} or {'logical_count'}) and REDUNDANT (its replica count).
+# FUSED_ROUTER=1 (MEGA=1, not with CAKE=1): the SM120 kernel routes from the gate logits itself (DeepSeek-V4.1's
+# router: sqrtsoftplus, correction bias, bias_vl for image tokens, top-k, renormalize, routed scaling, EPLB replica
+# pick) instead of SGLang's moe_fused_gate and EPLB remap (SGLANG_SM120_FUSED_ROUTER).
 # Extra arguments are appended to the server command line.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -74,7 +78,8 @@ if [ "$MEGA" = 1 ]; then
   ENVS+=(-e SGLANG_SM120_MEGA_MOE=1 -e SGLANG_SHARED_EXPERT_TP1=1
          -e SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=128
          -e SGLANG_SM120_MEGA_MOE_DIR=/opt/sm120_megamoe -e DG_SM120_MEGA_MOE_BUILD_DIR=/b
-         -e SGLANG_SM120_MEGA_MOE_TRANSPORT=$TRANSPORT -e SGLANG_SM120_MEGA_MOE_PACKED=${PACKED:-0})
+         -e SGLANG_SM120_MEGA_MOE_TRANSPORT=$TRANSPORT -e SGLANG_SM120_MEGA_MOE_PACKED=${PACKED:-0}
+         -e SGLANG_SM120_FUSED_ROUTER=${FUSED_ROUTER:-0})
   if [ "$TRANSPORT" != p2p ]; then
     # NCCL GIN needs the NCCL Device API, which needs cuMem (SGLang otherwise sets NCCL_CUMEM_ENABLE=0)
     ENVS+=(-e NCCL_CUMEM_ENABLE=1 -e NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7})

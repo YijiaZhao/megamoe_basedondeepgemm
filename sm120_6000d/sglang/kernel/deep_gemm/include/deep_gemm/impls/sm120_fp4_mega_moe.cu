@@ -95,8 +95,10 @@ constexpr int kMaxWorld = 16;
 constexpr int kMaxEl = 256;
 constexpr uint64_t kSpinNs = 30000000000ull;
 
-constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRouteWait = 4;
+constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRouteWait = 4, kErrRouterWait = 5;
 constexpr int kCtrDispatch = 0, kCtrQueue = 1, kCtrL2Done = 2, kCtrErr = 3, kCtrExit = 4, kCtrEpoch = 5;
+constexpr int kCtrRoute = 6;  // CTAs done with the in-kernel router (Route)
+constexpr int kMaxRouteE = 384;  // in-kernel router: experts (logical)
 constexpr int kCtrFlag = 8, kCtrL1 = 16;  // kCtrFlag: local copies (epoch) of the route / rows / combine flags
 // GIN: FC2 items done per tile (reset per call), cumulative signal totals received per kind and source (u64, kept)
 constexpr int kMaxTiles = 2304;  // sum over local experts of ceil(rows / 8): EL + W * TCAP * TOPK / 8, TCAP <= 64
@@ -137,6 +139,24 @@ struct Gin {
     int *cidx;              // [TCAP][TOPK] packed index at the GIN expert rank of copy (t, k)
 };
 
+// In-kernel router (DeepSeek-V4.1, SGLang's moe_fused_gate with sqrtsoftplus via log1p): from the gate logits, the
+// routes this call's topk_ids / topk_w are then written from (CTA b routes token b with one warp, the others wait).
+// logits [S][T][E] fp32, the S partial sums added in order; score = sqrt(l > 20 ? l : log1p(exp(l))), ranked by
+// score + bias (bias_alt where input_ids == alt_id; NaN first), top-k with the lowest id on ties, weight = score,
+// renormalized by sum (+ eps, or the zero-sum guard), times scale when apply_scale; EPLB (l2p [E][R], ascending, -1
+// padded): row t takes replica t % n of n (SGLang's 'dynamic' dispatch).
+struct Route {
+    const float *logits;  // null: topk_ids / topk_w are the caller's
+    const float *bias, *bias_alt;
+    const int64_t *input_ids;
+    int64_t alt_id;
+    const int *l2p;
+    int *ids;
+    float *w;
+    int S, E, R, renorm, apply_scale;
+    float eps, scale;
+};
+
 struct Args {
     const __nv_bfloat16 *x;   // [T][H]
     const int *topk_ids;      // [T][TOPK] global expert ids
@@ -153,6 +173,7 @@ struct Args {
     unsigned long long *stamps;  // optional [grid][16] globaltimer stamps (debug)
     Peers peers;
     Gin gin;
+    Route route;
     int T, H, I, EL, W, TOPK, TCAP, rank;
     float swiglu_limit;
     int w13_up_first;  // SM120_FP4_RM: W13 holds the up rows first (FlashInfer CUTLASS order)
@@ -643,6 +664,84 @@ __device__ __forceinline__ void item_decode(int item, int ntiles, int nblk1, int
 // queue last, so the head of the queue goes to the last CTAs.
 __device__ __forceinline__ int first_item(unsigned block, unsigned grid) { return int(grid - 1 - block); }
 
+// (value, -id) order: larger value first, then the lower expert id
+__device__ __forceinline__ bool route_better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }
+
+// one warp: token t's top-k of the in-kernel router into r.ids / r.w (lane k: the k-th pick)
+__device__ __forceinline__ void route_token(const Route &r, int t, int T, int K, int lane) {
+    constexpr int kPer = kMaxRouteE / 32;  // experts per lane (e = lane + 32 j)
+    const float *bias = r.bias_alt && r.input_ids && r.input_ids[t] == r.alt_id ? r.bias_alt : r.bias;
+    float lg[kPer], rank[kPer], score[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) lg[j] = 0.f;
+    for (int s = 0; s < r.S; ++s) {  // the slices in order; per slice the lane's experts loaded together
+        const float *ps = r.logits + (size_t(s) * T + t) * r.E + lane;
+        float v[kPer];
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) v[j] = lane + 32 * j < r.E ? __ldcg(ps + 32 * j) : 0.f;
+#pragma unroll
+        for (int j = 0; j < kPer; ++j) lg[j] += v[j];
+    }
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int e = lane + 32 * j;
+        rank[j] = -INFINITY;
+        score[j] = 0.f;
+        if (e < r.E) {
+            const float l = lg[j];
+            score[j] = sqrtf(l > 20.f ? l : log1pf(expf(l)));
+            const float v = score[j] + bias[e];
+            rank[j] = v == v ? v : INFINITY;  // NaN ranks first, as torch.topk
+        }
+    }
+    int sel = -1;
+    float sw = 0.f, sum = 0.f;
+    for (int k = 0; k < K; ++k) {
+        float bv = -INFINITY;
+        int bi = 1 << 30;
+#pragma unroll
+        for (int j = 0; j < kPer; ++j)
+            if (rank[j] != -INFINITY && route_better(rank[j], lane + 32 * j, bv, bi)) bv = rank[j], bi = lane + 32 * j;
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (route_better(ov, oi, bv, bi)) bv = ov, bi = oi;
+        }
+        float w = 0.f;
+        if (lane == bi % 32) {
+#pragma unroll
+            for (int j = 0; j < kPer; ++j)
+                if (j == bi / 32) w = score[j], rank[j] = -INFINITY;
+        }
+        w = __shfl_sync(0xffffffffu, w, bi % 32);
+        sum += w;
+        if (lane == k) sel = bi, sw = w;
+    }
+    {  // moe_fused_gate's tl.sum over its K slots (lanes, xor 2 / 1 / 4) and its division (div.full.f32)
+        float v = lane < K ? sw : 0.f;
+        v += __shfl_xor_sync(0xffffffffu, v, 2);
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        v += __shfl_xor_sync(0xffffffffu, v, 4);
+        sum = __shfl_sync(0xffffffffu, v, 0);
+    }
+    if (r.renorm) {
+        const float den = r.eps > 0.f ? sum + r.eps : (sum > 0.f ? sum : 1.f);
+        asm("div.full.f32 %0, %1, %2;" : "=f"(sw) : "f"(sw), "f"(den));
+    }
+    if (r.apply_scale) sw *= r.scale;
+    if (lane < K) {
+        if (r.l2p) {
+            const int *cand = r.l2p + size_t(sel) * r.R;
+            int n = 0;
+            while (n < r.R && cand[n] >= 0) ++n;
+            sel = cand[n > 1 ? t % n : 0];
+        }
+        r.ids[t * K + lane] = sel;
+        r.w[t * K + lane] = sw;
+    }
+}
+
 template <int NT>  // tokens per item: NT x 8
 // two CTAs per SM (the grid is sized from the occupancy): the register budget is 128, which the unrolled weight loop
 // uses to keep loads in flight
@@ -678,6 +777,20 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     __syncthreads();
     const int epoch = s_epoch;
     int *ctr = a.ctr;
+    if (a.route.logits && a.T > 0) {  // in-kernel router: CTA b routes tokens b, b + grid, ...; every CTA then waits
+        for (int t = blockIdx.x; t < a.T; t += gridDim.x)
+            if (warp == 0) route_token(a.route, t, a.T, a.TOPK, lane);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (int(blockIdx.x) < a.T) {
+                __threadfence();
+                atomicAdd(ctr + kCtrRoute, 1);
+            }
+            // the routing CTAs wait on nothing before their count: no deadlock even when not all CTAs are resident
+            if (!wait_ge(ctr + kCtrRoute, min(a.T, int(gridDim.x)), false)) atomicExch(ctr + kCtrErr, kErrRouterWait);
+        }
+        __syncthreads();
+    }
 #if SM120_FP4_GIN_DEVICE
     __shared__ int s_ncopy[kMaxWorld];  // this rank's copies to each rank (GIN signal counts), counted by the whole CTA
     if (a.gin.mask) {
@@ -1224,6 +1337,7 @@ exit_kernel:
                 for (int u = 0; u < m.tiles_prefix[EL]; ++u) ctr[kCtrTile + u] = 0;
 #endif
             ctr[kCtrDispatch] = 0;
+            ctr[kCtrRoute] = 0;
             ctr[kCtrQueue] = 0;
             ctr[kCtrL2Done] = 0;
             for (int el = 0; el < EL; ++el) ctr[kCtrL1 + el] = 0;
@@ -1567,8 +1681,34 @@ std::vector<int64_t> counters() {
 
 void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::Tensor out, torch::Tensor w13,
          torch::Tensor ws13, torch::Tensor w2, torch::Tensor ws2, c10::optional<torch::Tensor> gscale,
-         double swiglu_limit, int64_t tile_tokens, c10::optional<torch::Tensor> stamps, bool w13_up_first) {
+         double swiglu_limit, int64_t tile_tokens, c10::optional<torch::Tensor> stamps, bool w13_up_first,
+         c10::optional<torch::Tensor> logits, c10::optional<torch::Tensor> rbias, c10::optional<torch::Tensor> rbias_alt,
+         c10::optional<torch::Tensor> input_ids, int64_t alt_id, c10::optional<torch::Tensor> l2p, bool renorm,
+         double eps, bool apply_scale, double rscale) {
+    // logits ([S, T, E] fp32): the in-kernel router (Route) writes this call's routes into topk_ids / topk_w first
     Args a{};
+    if (logits.has_value()) {
+        TORCH_CHECK(logits->scalar_type() == torch::kFloat32 && logits->dim() == 3 && logits->is_contiguous() &&
+                        logits->size(1) == x.size(0) && logits->size(2) <= kMaxRouteE,
+                    "router logits: [slices, T, E <= 384] fp32");
+        TORCH_CHECK(rbias.has_value() && rbias->scalar_type() == torch::kFloat32 && rbias->numel() == logits->size(2));
+        TORCH_CHECK(!rbias_alt.has_value() || (rbias_alt->scalar_type() == torch::kFloat32 && input_ids.has_value() &&
+                                                input_ids->scalar_type() == torch::kInt64));
+        TORCH_CHECK(!l2p.has_value() || (l2p->scalar_type() == torch::kInt32 && l2p->dim() == 2 &&
+                                          l2p->size(0) == logits->size(2) && l2p->is_contiguous()));
+        Route &r = a.route;
+        r.logits = logits->data_ptr<float>();
+        r.S = int(logits->size(0)), r.E = int(logits->size(2));
+        r.bias = rbias->data_ptr<float>();
+        r.bias_alt = rbias_alt.has_value() ? rbias_alt->data_ptr<float>() : nullptr;
+        r.input_ids = rbias_alt.has_value() ? input_ids->data_ptr<int64_t>() : nullptr;
+        r.alt_id = alt_id;
+        r.l2p = l2p.has_value() ? l2p->data_ptr<int>() : nullptr;
+        r.R = l2p.has_value() ? int(l2p->size(1)) : 1;
+        r.ids = topk_ids.data_ptr<int>();
+        r.w = topk_w.data_ptr<float>();
+        r.renorm = renorm, r.eps = float(eps), r.apply_scale = apply_scale, r.scale = float(rscale);
+    }
     a.x = reinterpret_cast<const __nv_bfloat16 *>(x.data_ptr());
     a.topk_ids = topk_ids.data_ptr<int>();
     a.topk_w = topk_w.data_ptr<float>();
