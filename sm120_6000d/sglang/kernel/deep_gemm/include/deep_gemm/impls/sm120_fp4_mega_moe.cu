@@ -392,7 +392,7 @@ __device__ __forceinline__ void quad_transpose(uint32_t (&v)[4], int c) {
 template <int NT>
 __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], const uint8_t *W, const uint32_t *WS,
                                              int nb0, int rpb, int roff, int K, const uint32_t *const (&xrow)[NT],
-                                             const uint32_t *const (&xsrow)[NT], int lane) {
+                                             const uint32_t *const (&xsrow)[NT], int lane, int nsub) {
     const int g = lane / 4, c = lane % 4;
     const int kch = K / 64, kw = K / kSfWordK;
     const uint4 *wp[kNbPerWarp][2];
@@ -452,7 +452,7 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
             const int kc = k0 + u;
             uint32_t sfb[NT];
 #pragma unroll
-            for (int s = 0; s < NT; ++s) sfb[s] = xsrow[s][kc / 2];
+            for (int s = 0; s < NT; ++s) sfb[s] = NT == 1 || s < nsub ? xsrow[s][kc / 2] : 0u;
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int step = kc * 2 + h;
@@ -460,6 +460,10 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
                 uint32_t b0[NT], b1[NT];  // activation elements 8c + {0, 2, 4, 6} / 8c + {1, 3, 5, 7}
 #pragma unroll
                 for (int s = 0; s < NT; ++s) {
+                    if (NT > 1 && s >= nsub) {  // past the tile's tokens (warp-uniform)
+                        b0[s] = b1[s] = 0u;
+                        continue;
+                    }
                     const uint2 x = reinterpret_cast<const uint2 *>(xrow[s])[step * 4 + c];
                     b0[s] = __byte_perm(x.x, x.y, 0x6420u);
                     b1[s] = __byte_perm(x.x, x.y, 0x7531u);
@@ -470,7 +474,8 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
                     expand(wv[j][u][h][0], wa[0], wa[2]);
                     expand(wv[j][u][h][1], wa[1], wa[3]);
 #pragma unroll
-                    for (int s = 0; s < NT; ++s) mma_w4a8(acc[j][s], wa, b0[s], b1[s], sfa[j][u / 2], sel, sfb[s], sel);
+                    for (int s = 0; s < NT; ++s)
+                        if (NT == 1 || s < nsub) mma_w4a8(acc[j][s], wa, b0[s], b1[s], sfa[j][u / 2], sel, sfb[s], sel);
                 }
             }
         }
@@ -951,7 +956,8 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                 // gate rows: block row g, up rows: g + 8 (I rows apart, before or after the gate rows)
                 item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w13 + el * w13_expert) +
                                           (a.w13_up_first ? size_t(I) * (H / 2) : 0),
-                                 a.ws13 + el * ws13_expert, nb0, 8, a.w13_up_first ? -I : I, H, xr, xs, lane);
+                                 a.ws13 + el * ws13_expert, nb0, 8, a.w13_up_first ? -I : I, H, xr, xs, lane,
+                                 (ntok + kTile - 1) / kTile);
 #else
                 item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
 #endif
@@ -999,7 +1005,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                 }
 #if SM120_FP4_RM
                 item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w2 + el * w2_expert), a.ws2 + el * ws2_expert,
-                                 nb0, 16, 8, I, xr, xs, lane);
+                                 nb0, 16, 8, I, xr, xs, lane, (ntok + kTile - 1) / kTile);
 #else
                 item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
 #endif
@@ -1531,13 +1537,13 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     a.swiglu_limit = float(swiglu_limit);
     TORCH_CHECK(!w13_up_first || kRm, "w13_up_first: row-major weights ('w4a8_rm') only");
     a.w13_up_first = int(w13_up_first);
-    // tokens per item: 0 = from the expected tokens per local expert (this rank's T, uniform routing)
+    // tokens per item: 0 = automatic. Row-major W4A8: 16, a tile of at most 8 tokens skips its second sub-tile
+    // (6000D EP8, cold L2, DSV4.1: no slower than 8 at 1-64 tokens per rank, up to 20% faster). Other formats: from
+    // the expected tokens per local expert (this rank's T, uniform routing), 8 while one sub-tile holds them, 16 beyond
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
         const float per_expert = float(a.T) * a.TOPK / a.EL;
-        // swept on 6000D EP8, cold L2, 1-64 tokens per rank, every format: 8 while one sub-tile holds an expert's
-        // tokens, 16 beyond
-        nt = per_expert > 8.f ? 2 : 1;
+        nt = kRm || per_expert > 8.f ? 2 : 1;
     }
     TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8 or 16");
     auto stream = c10::cuda::getCurrentCUDAStream();
