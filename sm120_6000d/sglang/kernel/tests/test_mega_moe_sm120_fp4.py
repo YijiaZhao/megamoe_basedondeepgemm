@@ -161,7 +161,7 @@ def verify(fmt, shape, rank, world, group, transport):
              * 0.5).bfloat16()
         ref = reference(x, ids, wts, lambda g: expert_codes(g, h, i, fmt), i, fmt)
         for up_first, (l1, l2, gs) in weights:
-            for tile in (0, 8, 16):  # 0: the automatic choice
+            for tile in (0, 8, 16, 32):  # 0: the automatic choice
                 y = torch.zeros(t, h, device='cuda', dtype=torch.bfloat16)
                 for _ in range(2):  # the second call checks the per-call state was reset
                     fp4.fp4_mega_moe_sm120(y, x, ids, wts, l1, l2, buf, gs, activation_clamp=LIMIT, tile_tokens=tile,

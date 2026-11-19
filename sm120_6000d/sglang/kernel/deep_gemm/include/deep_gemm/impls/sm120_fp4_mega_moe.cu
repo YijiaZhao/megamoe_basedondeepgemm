@@ -87,8 +87,8 @@ constexpr int kQW = kSfVec / (4 * kXB);  // u32 per quantized scale group
 constexpr int kWarps = 8;
 constexpr int kNbPerWarp = 1;
 constexpr int kRowsPerItem = kWarps * kNbPerWarp * 16;  // 128 weight rows per work item
-constexpr int kTile = 8;                                // tokens per MMA (N); an item takes NT of them
-constexpr int kMaxNt = 2;
+constexpr int kTile = 8;                                // tokens per MMA (N); an item takes NT (1, 2 or 4) of them
+constexpr int kMaxNt = 4;
 constexpr size_t kPf0Bytes = size_t(64) << 20;          // t=0 L2 prefetch budget over the locally known experts
 constexpr int kUnroll = 4;
 constexpr int kMaxWorld = 16;
@@ -365,6 +365,22 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
 }
 
 #if SM120_FP4_RM
+__device__ __forceinline__ void cp_async16(void *dst, const void *src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(uint32_t(__cvta_generic_to_shared(dst))), "l"(src)
+                 : "memory");
+}
+__device__ __forceinline__ void cp_async8(void *dst, const void *src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(uint32_t(__cvta_generic_to_shared(dst))), "l"(src)
+                 : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+
+// activation staging of item_gemm_rm: per K step (kUnroll K64 chunks) a token's kStageB value bytes, rows kStageRow
+// apart (the pad spreads the 8 token rows a warp reads at once over the banks), and its kStageW scale words
+constexpr int kStageB = kUnroll * 64, kStageRow = kStageB + 32, kStageW = kUnroll / 2;
+
 // 4x4 word transpose across the lanes of a quad: v[q] of lane c becomes v[c] of lane q
 __device__ __forceinline__ void quad_transpose(uint32_t (&v)[4], int c) {
 #pragma unroll
@@ -389,11 +405,26 @@ __device__ __forceinline__ void quad_transpose(uint32_t (&v)[4], int c) {
 // 8c + 2i + p): lane c loads 16 contiguous bytes (block c of a K128) of rows g and g + 8, the quad transposes, and
 // lane c holds bytes 4c..4c+3 of every block, whose even / odd nibbles are its A registers of k 4c.. / 16+4c..
 // (`expand`, as for the packed layout); its activation bytes 8c..8c+7 split the same way (byte_perm).
+// The item's tokens are the same for its 8 warps: the whole CTA stages their activations (xr / xs: token tk's value
+// row / scale words, the item's live sub-tiles only) one K step ahead with cp.async into sx / ss ([2][kT] rows, double
+// buffered), and every warp reads them from shared memory instead of each loading them from global memory.
+// Every thread of the CTA calls it.
 template <int NT>
 __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], const uint8_t *W, const uint32_t *WS,
-                                             int nb0, int rpb, int roff, int K, const uint32_t *const (&xrow)[NT],
-                                             const uint32_t *const (&xsrow)[NT], int lane, int nsub) {
+                                             int nb0, int rpb, int roff, int K, const uint8_t *const *xr,
+                                             const uint32_t *const *xs, uint8_t *sx, uint32_t *ss, int lane, int nsub) {
+    constexpr int kT = kTile * NT;
     const int g = lane / 4, c = lane % 4;
+    const int ntk = (NT == 1 ? 1 : nsub) * kTile;
+    auto stage = [&](int k0, int b) {
+        for (int u = threadIdx.x; u < ntk * (kStageB / 16); u += blockDim.x) {
+            const int tk = u / (kStageB / 16), q = u % (kStageB / 16);
+            cp_async16(sx + (b * kT + tk) * kStageRow + q * 16, xr[tk] + k0 * 64 + q * 16);
+        }
+        for (int tk = threadIdx.x; tk < ntk; tk += blockDim.x)
+            cp_async8(ss + (b * kT + tk) * kStageW, xs[tk] + k0 / 2);
+        cp_async_commit();
+    };
     const int kch = K / 64, kw = K / kSfWordK;
     const uint4 *wp[kNbPerWarp][2];
     const uint32_t *sp[kNbPerWarp];
@@ -427,14 +458,23 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
 #pragma unroll
             for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = __ldg(sp[j] + (k0 / 2 + s) * 16);
     };
+    stage(0, 0);
     if constexpr (kDb) load(0, wq, sfa);
 #pragma unroll 2
     for (int k0 = 0; k0 < kch; k0 += kUnroll) {
+        const int buf = (k0 / kUnroll) & 1;
+        if (k0 + kUnroll < kch) {
+            stage(k0 + kUnroll, buf ^ 1);
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
         if constexpr (kDb) {
             if (k0 + kUnroll < kch) load(k0 + kUnroll, wn, sfn);
         } else {
             load(k0, wq, sfa);
         }
+        __syncthreads();  // this step's activations staged by every thread
         uint32_t wv[kNbPerWarp][kUnroll][2][2];  // [block][K64 chunk][K32 step][row g / g + 8]
 #pragma unroll
         for (int p = 0; p < kQ; ++p)
@@ -452,7 +492,8 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
             const int kc = k0 + u;
             uint32_t sfb[NT];
 #pragma unroll
-            for (int s = 0; s < NT; ++s) sfb[s] = NT == 1 || s < nsub ? xsrow[s][kc / 2] : 0u;
+            for (int s = 0; s < NT; ++s)
+                sfb[s] = NT == 1 || s < nsub ? ss[(buf * kT + s * kTile + g) * kStageW + (kc - k0) / 2] : 0u;
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const int step = kc * 2 + h;
@@ -464,7 +505,8 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
                         b0[s] = b1[s] = 0u;
                         continue;
                     }
-                    const uint2 x = reinterpret_cast<const uint2 *>(xrow[s])[step * 4 + c];
+                    const uint2 x = reinterpret_cast<const uint2 *>(sx + (buf * kT + s * kTile + g) * kStageRow)
+                        [((kc - k0) * 2 + h) * 4 + c];
                     b0[s] = __byte_perm(x.x, x.y, 0x6420u);
                     b1[s] = __byte_perm(x.x, x.y, 0x7531u);
                 }
@@ -488,6 +530,7 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
                 for (int s = 0; s < kSw; ++s) sfa[j][s] = sfn[j][s];
             }
         }
+        __syncthreads();  // every warp is done with this buffer before the next step stages into it
     }
 }
 #endif
@@ -609,8 +652,23 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     const int H = a.H, I = a.I, EL = a.EL, W = a.W, TOPK = a.TOPK, TCAP = a.TCAP;
     __shared__ Map m;
     __shared__ int s_item, s_ok, s_epoch, s_last;
-    // L1: [tok][64 inter] / L2: [tok][128 hidden] fp32 / dispatch: one FP4 token row (H/2 + H/kSfVec bytes)
-    __shared__ __align__(16) float s_tile[kT][kRowsPerItem];
+    // L1: [tok][64 inter] / L2: [tok][128 hidden] fp32 / dispatch: one FP4 token row (H/2 + H/kSfVec bytes).
+    // SM120_FP4_RM: the same bytes hold item_gemm_rm's activation staging while an item's GEMM runs (the epilogues use
+    // s_tile only after it)
+#if SM120_FP4_RM
+    constexpr int kSx = 2 * kT * kStageRow, kSxs = kSx + 2 * kT * kStageW * 4;
+    constexpr int kRaw = kT * kRowsPerItem * 4 > kSxs ? kT * kRowsPerItem * 4 : kSxs;
+#else
+    constexpr int kRaw = kT * kRowsPerItem * 4;
+#endif
+    __shared__ __align__(16) uint8_t s_raw[kRaw];
+    auto s_tile = reinterpret_cast<float (*)[kRowsPerItem]>(s_raw);
+#if SM120_FP4_RM
+    uint8_t *const s_sx = s_raw;
+    uint32_t *const s_ss = reinterpret_cast<uint32_t *>(s_raw + kSx);
+    __shared__ const uint8_t *s_xr[kT];  // the item's token rows: values / scale words
+    __shared__ const uint32_t *s_xs[kT];
+#endif
 
     unsigned long long st_[16] = {gtime()};  // 0 start 1 pushed 2 flags 3 work end 4 comb flags 5 end 6 L1-wait ns 7 items 8 route-push 9 route-ok 10 map 11 pf 12 flag-sent 13 last FC1 14 first FC2 15 comb release
     if (threadIdx.x == 0) {
@@ -944,6 +1002,21 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
             const uint32_t *xr[NT], *xs[NT];
             const int nb0 = (rb * kRowsPerItem) / 16 + warp * kNbPerWarp;
             if (l1) {
+#if SM120_FP4_RM
+                if (threadIdx.x < kT) {  // token tk's row (past the tile's tokens: its first token)
+                    int w, i;
+                    token_src(m, el, tile * kT + (int(threadIdx.x) < ntok ? int(threadIdx.x) : 0), W, w, i);
+                    const uint8_t *row = row_ptr(el, w, i);
+                    s_xr[threadIdx.x] = row;
+                    s_xs[threadIdx.x] = reinterpret_cast<const uint32_t *>(row + H / kXB);
+                }
+                __syncthreads();
+                // gate rows: block row g, up rows: g + 8 (I rows apart, before or after the gate rows)
+                item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w13 + el * w13_expert) +
+                                          (a.w13_up_first ? size_t(I) * (H / 2) : 0),
+                                 a.ws13 + el * ws13_expert, nb0, 8, a.w13_up_first ? -I : I, H, s_xr, s_xs, s_sx, s_ss,
+                                 lane, (ntok + kTile - 1) / kTile);
+#else
 #pragma unroll
                 for (int s = 0; s < NT; ++s) {
                     int w, i;
@@ -952,13 +1025,6 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                     xr[s] = reinterpret_cast<const uint32_t *>(row);
                     xs[s] = reinterpret_cast<const uint32_t *>(row + H / kXB);
                 }
-#if SM120_FP4_RM
-                // gate rows: block row g, up rows: g + 8 (I rows apart, before or after the gate rows)
-                item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w13 + el * w13_expert) +
-                                          (a.w13_up_first ? size_t(I) * (H / 2) : 0),
-                                 a.ws13 + el * ws13_expert, nb0, 8, a.w13_up_first ? -I : I, H, xr, xs, lane,
-                                 (ntok + kTile - 1) / kTile);
-#else
                 item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
 #endif
                 const float alpha = kNv ? a.gscale[0] * a.gscale[2 + el] : 1.f;
@@ -997,16 +1063,22 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                 if (threadIdx.x == 0) atomicAdd(ctr + kCtrL1 + el, 1);
                 st_[13] = gtime();
             } else {
+#if SM120_FP4_RM
+                if (threadIdx.x < kT) {
+                    const size_t r = size_t(el) * TOKE + tile * kT + (int(threadIdx.x) < ntok ? int(threadIdx.x) : 0);
+                    s_xr[threadIdx.x] = a.inter + r * (I / kXB);
+                    s_xs[threadIdx.x] = a.inter_s + r * (I / kSfWordK);
+                }
+                __syncthreads();
+                item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w2 + el * w2_expert), a.ws2 + el * ws2_expert,
+                                 nb0, 16, 8, I, s_xr, s_xs, s_sx, s_ss, lane, (ntok + kTile - 1) / kTile);
+#else
 #pragma unroll
                 for (int s = 0; s < NT; ++s) {
                     const size_t r = size_t(el) * TOKE + js[s];
                     xr[s] = reinterpret_cast<const uint32_t *>(a.inter + r * (I / kXB));
                     xs[s] = a.inter_s + r * (I / kSfWordK);
                 }
-#if SM120_FP4_RM
-                item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w2 + el * w2_expert), a.ws2 + el * ws2_expert,
-                                 nb0, 16, 8, I, xr, xs, lane, (ntok + kTile - 1) / kTile);
-#else
                 item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
 #endif
                 const float alpha = kNv ? a.gscale[1] * a.gscale[2 + EL + el] : 1.f;
@@ -1433,7 +1505,7 @@ static void setup_local() {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
     const int sms = prop.multiProcessorCount;
-    g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms);
+    g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms), g.grid[4] = grid_for<4>(sms);
 }
 
 // P2P transport: one cudaMalloc, shared over cudaIpc; returns this rank's handle bytes (open_peers takes everyone's)
@@ -1545,10 +1617,12 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
         const float per_expert = float(a.T) * a.TOPK / a.EL;
         nt = kRm || per_expert > 8.f ? 2 : 1;
     }
-    TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8 or 16");
+    TORCH_CHECK((nt == 1 || nt == 2 || nt == 4) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
+                "tile_tokens: 8, 16 or 32");
     auto stream = c10::cuda::getCurrentCUDAStream();
     switch (nt) {
         case 1: sm120_fp4_mega_moe_kernel<1><<<g.grid[1], kWarps * 32, 0, stream>>>(a); break;
+        case 4: sm120_fp4_mega_moe_kernel<4><<<g.grid[4], kWarps * 32, 0, stream>>>(a); break;
         default: sm120_fp4_mega_moe_kernel<2><<<g.grid[2], kWarps * 32, 0, stream>>>(a); break;
     }
     CHECK_CUDA(cudaGetLastError());
