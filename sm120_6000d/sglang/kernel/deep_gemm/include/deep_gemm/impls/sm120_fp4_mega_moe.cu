@@ -1609,13 +1609,14 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     a.swiglu_limit = float(swiglu_limit);
     TORCH_CHECK(!w13_up_first || kRm, "w13_up_first: row-major weights ('w4a8_rm') only");
     a.w13_up_first = int(w13_up_first);
-    // tokens per item: 0 = automatic. Row-major W4A8: 16, a tile of at most 8 tokens skips its second sub-tile
-    // (6000D EP8, cold L2, DSV4.1: no slower than 8 at 1-64 tokens per rank, up to 20% faster). Other formats: from
-    // the expected tokens per local expert (this rank's T, uniform routing), 8 while one sub-tile holds them, 16 beyond
+    // tokens per item: 0 = automatic. Row-major W4A8: 32 from 32 tokens per rank (real routing piles many tokens on a
+    // few experts; 6000D EP8 DSV4.1 at 96 per rank: 902 -> 844 us), 16 below (1-8 per rank: 7-15 us faster than 32);
+    // a tile skips its empty sub-tiles. Other formats: from the expected tokens per local expert (this rank's T,
+    // uniform routing), 8 while one sub-tile holds them, 16 beyond
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
         const float per_expert = float(a.T) * a.TOPK / a.EL;
-        nt = kRm || per_expert > 8.f ? 2 : 1;
+        nt = kRm ? (a.T >= 32 ? 4 : 2) : per_expert > 8.f ? 2 : 1;
     }
     TORCH_CHECK((nt == 1 || nt == 2 || nt == 4) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
                 "tile_tokens: 8, 16 or 32");

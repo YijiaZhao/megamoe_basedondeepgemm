@@ -8,7 +8,7 @@ kernel 是本仓库的 `fp4_mega_moe_sm120`，用新格式 `w4a8_rm`（MXFP4 权
 
 | `kernel/` 下的文件 | 相对仓库同名文件的改动 |
 |---|---|
-| `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变；路由计数按 epoch 奇偶双缓冲（与仓库主 kernel 相同） |
+| `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe.cu` | 编译开关 `SM120_FP4_RM`（只给 `w4a8_rm`）：`item_gemm_rm` 读行主序权重（每 lane 读 16 字节，quad 内 4×4 转置成 `mma_w4a8` 的寄存器排布），L2 预取按行主序地址；`w13_up_first`：W13 是 up 行在前（FlashInfer 的顺序）。其他格式的代码不变；路由计数按 epoch 奇偶双缓冲（与仓库主 kernel 相同）。`w4a8_rm` 的 item：激活值按 K 分段用 `cp.async` 暂存到共享内存（item 的 8 个 warp 共用，只读一次，提前一段预取），每 rank ≥ 32 token 时一个 item 32 个 token、否则 16 个，item 里没有 token 的 8-token 子块跳过 |
 | `deep_gemm/mega/sm120_fp4.py` | `FORMATS` 加 `w4a8_rm`；权重转换对 `w4a8_rm` 只重排 scale、权重原样返回；`w13_up_first` 参数；缓冲区参数 `slot`：扩展的状态是静态的，一个进程里每多一种 MoE 形状就占一个 slot，各加载一份扩展（`_s1` 后缀），主模型用 slot 0、DSPARK draft 模型用 slot 1 |
 | `deep_gemm/include/deep_gemm/impls/sm120_fp4_mega_moe_gin.cu`、`deep_gemm/mega/sm120_fp4_transport.py` | 无改动（`sm120_fp4.py` 按相对路径找它们，一起拷过来）|
 | `deep_gemm/mega/sm120_fp4_relayout.py`（新）、`tests/test_relayout.py` | `PACKED=1`（默认关，未做端到端测试）用：FlashInfer 行主序权重与 kernel 的 packed `w4a8` 布局互转 |
@@ -188,14 +188,17 @@ Cake 这一列 gsm8k（1319 题，256 并发）0.901。
 | .6（CX8aaS）| `lsa_where_reachable` + 8 网卡 | 58.5 / 57.6 / 75.5 | 48.2 / 48.1 / 65.1 | −16.5% | 2332 → 2745 |
 | .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=0` | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 44.3 / 45.6 / 60.6 | −18.7% | 2589 → 3032 |
 | .1（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1` 不含 `b12x`² | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | 36.2 / 35.5 / 48.2 | −36.7% | 2589 → 3826 |
-| .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`（默认）³ | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **33.1 / 32.7 / 43.7** | −41.7% | 2589 → **3989** |
+| .6（CX8aaS），EPLB 8 个冗余专家，`DENSE_OPT=1`（默认）³ | `lsa_where_reachable` + 8 网卡 | 55.6 / 56.1 / 82.6 | **31.5 / 30.3 / 40.9** | −46.0% | 2589 → **4430** |
 | .20（Broadcom）¹ | `p2p` | — / 57.3 / 80.2 | — / 48.8 / 64.7 | −14.8% | 2217 → 2818 |
 
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
 ² 当时 FP8 线性层全走 CUTLASS（`SGLANG_SM120_MXFP8_B12X_MIN_N=0`）。基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。
 每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
-³ 每步间隔 69.2 ms；按 10 步 profile，FP8 GEMM 每步 10.8 → 7.5 ms（`b12x`），整步 72.9 → 69.6 ms，其余部分不变。
+³ 当前 kernel（激活值暂存到共享内存，每 rank ≥ 32 token 用 32-token item）：每步间隔（SSE gap）P50 64.9 ms，接受长度 2.42、
+draft 接受率 28.5%。上一版 kernel 同配置 33.1 / 32.7 / 43.7 ms、3989 tok/s、每步间隔 P50 69.5 ms；FlashInfer Cake（主模型
+MoE 全走 Cake，`--mem-fraction-static 0.76`）同配置 34.9 / 33.6 / 41.4 ms、4085 tok/s、70.5 ms。
+按 10 步 profile，FP8 GEMM 每步 10.8 → 7.5 ms（`b12x`），整步 72.9 → 69.6 ms，其余部分不变。
 
 精度：gsm8k（1319 题，128 并发）基线 0.907，MegaMoE（主模型 + draft，.6）0.900；开 EPLB：基线 0.917，MegaMoE 0.918；
-EPLB + `DENSE_OPT=1`：不含 `b12x` 0.909，含 `b12x` 0.903。
+EPLB + `DENSE_OPT=1`：不含 `b12x` 0.909，含 `b12x` 0.903，当前 kernel 0.908。
 逐层对比（同一输入，kernel 对 FlashInfer）：相对误差中位数 1.4%，余弦相似度 ≥ 0.9997。
