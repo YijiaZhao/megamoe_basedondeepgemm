@@ -44,6 +44,8 @@ curl -s localhost:30041/generate -H 'Content-Type: application/json' \
 docker rm -f dsv41_sglang                        # 停掉
 ```
 
+`EPLB=1` 用的放置文件是在本文的测试数据上统计的，只用来复现本文结果；实际部署要在自己的负载上重新统计，见“启动”一节的 EPLB 说明。
+
 ### 两台机器，EP16，主模型 MoE 全走 FlashInfer Cake（最快）
 
 两台 8 卡机器（测试用 .6 + .1，CX8aaS），TP16 / DP16 attention / EP16。主模型的 MoE（prefill 和 decode，包括 CUDA graph）
@@ -64,7 +66,7 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 DP=16 OTHER_HOSTS=10.6.142.1 CLIENT_DIR=/path/nvidia_decode_client_20261111 DATA=/path/public_pg19_all.jsonl.gz bash bench_bs16.sh
 ```
 
-- `EPLB=1` 在 `NNODES=2` 时用 `eplb_map_r16_ep16.pt`（`{'logical_count'}`，同一个 decode bench 上统计），384 个专家加 16 个副本，每卡 25 个。
+- `EPLB=1` 在 `NNODES=2` 时用 `eplb_map_r16_ep16.pt`（`{'logical_count'}`，同一个 decode bench 上统计），384 个专家加 16 个副本，每卡 25 个；同样只是示例，实际使用要重新统计。
 - `CAKE_MAX_TOKENS` 默认 2048，即 SGLang 每 rank 的 prefill 分块（`--chunked-prefill-size` = 2048 × 16）；设到 16384 时 EP8 上 Cake 的通信缓冲区分配（`ncclMemAlloc`）失败。
 - `--mem-fraction-static 0.66`：EP16 时 Cake 和 NCCL 的缓冲区约占 14 GB 显存，0.8 / 0.76 会在 indexer 处 OOM；KV 池仍远大于测试所需。
 - 多机时 engram 表每台机器一份（各机 local rank 0 建共享内存，本机 rank 分摊加载）。
@@ -127,6 +129,10 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash lau
 每卡 49 个，热门专家复制、按负载摊到 8 张卡；draft 模型不动。`eplb_map_r8_ep8.pt` 是 `{'physical_to_logical_map': [40 层, 392]}`：
 在同一个 decode bench（pg19，每 rank BS16、输入 100K）上统计主模型每层每个专家的 token 数，用 SGLang 的
 `eplb_algorithms.rebalance_experts`（`auto`，单机，8 卡）算出来。换负载或卡数要另算一份，用 `EPLB_MAP=<文件> REDUNDANT=<副本数>` 传入。
+
+本仓库关注的是 kernel 性能，不负责专家怎么统计、怎么放置；kernel 只按拿到的物理专家号计算，放置用什么都不影响代码。
+`eplb_map_r8_ep8.pt` 和 `eplb_map_r16_ep16.pt` 只是复现本文结果用的示例：它们是用待测的这份数据统计出来的，结果表里开 EPLB 的数字
+都是这份数据配它自己的放置测得的。真正使用时必须在自己的负载和卡数上重新统计（离线统计或 SGLang 在线统计都行），不能直接拿这两份文件用。
 
 **FP8 GEMM 与 indexer**（`DENSE_OPT`，`MEGA=1` 时默认 `1`，`MEGA=0` 时默认 `0`）：
 - `--fp8-gemm-backend flashinfer_cutlass`：模型的 FP8 线性层（attention 投影、共享专家等，32×32 块、ue8m0 scale）按 MXFP8 原样交给 FlashInfer CUTLASS，权重不变；默认会走未调优的 Triton。
