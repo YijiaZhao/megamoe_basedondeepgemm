@@ -91,8 +91,17 @@ constexpr int kTile = 8;                                // tokens per MMA (N); a
 constexpr int kMaxNt = 4;
 constexpr size_t kPf0Bytes = size_t(64) << 20;          // t=0 L2 prefetch budget over the locally known experts
 constexpr int kUnroll = 4;
-constexpr int kMaxWorld = 16;
-constexpr int kMaxEl = 256;
+// The widest group and the work-item table are build parameters: the default build takes up to 16 ranks; sm120_fp4.py
+// builds groups of 17 to 32 ranks with -DSM120_FP4_MAX_WORLD=32 -DSM120_FP4_MAX_TILES=6400 (EP32: 4 hosts x 8 GPUs).
+#ifndef SM120_FP4_MAX_WORLD
+#define SM120_FP4_MAX_WORLD 16
+#endif
+#ifndef SM120_FP4_MAX_TILES
+#define SM120_FP4_MAX_TILES 2304
+#endif
+constexpr int kMaxWorld = SM120_FP4_MAX_WORLD;
+static_assert(kMaxWorld == 16 || kMaxWorld == 32, "builds for up to 16 and up to 32 ranks");
+constexpr int kMaxEl = 4096 / kMaxWorld;  // local experts: 256 (128 in the 32-rank build), Map::cnt keeps its size
 constexpr uint64_t kSpinNs = 30000000000ull;
 
 constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRouteWait = 4, kErrRouterWait = 5;
@@ -101,7 +110,9 @@ constexpr int kCtrRoute = 6;  // CTAs done with the in-kernel router (Route)
 constexpr int kMaxRouteE = 384;  // in-kernel router: experts (logical)
 constexpr int kCtrFlag = 8, kCtrL1 = 16;  // kCtrFlag: local copies (epoch) of the route / rows / combine flags
 // GIN: FC2 items done per tile (reset per call), cumulative signal totals received per kind and source (u64, kept)
-constexpr int kMaxTiles = 2304;  // sum over local experts of ceil(rows / 8): EL + W * TCAP * TOPK / 8, TCAP <= 64
+// sum over local experts of ceil(rows / 8): EL + W * TCAP * TOPK / 8; 2304: TCAP <= 64 at 16 ranks and top-8; the
+// 32-rank build's 6400: DeepSeek-V4.1's top-6 at EP32 up to 266 tokens per rank
+constexpr int kMaxTiles = SM120_FP4_MAX_TILES;
 constexpr int kCtrTile = kCtrL1 + kMaxEl, kCtrCum = kCtrTile + kMaxTiles;
 constexpr int kCtrInts = kCtrCum + 2 * 3 * kMaxWorld;
 static_assert(kCtrCum % 2 == 0, "the cumulative GIN totals must be 8-byte aligned");
@@ -1595,7 +1606,9 @@ static void layout(int rank, int world, int EL, int TCAP, int H, int I, int TOPK
     g.off_route = o; o = align_up(o + 2 * size_t(world) * EL * 4);  // two halves, by epoch parity
     g.off_rtflag = o; o = align_up(o + size_t(world) * 4);
     if (window) {
-        TORCH_CHECK(EL + world * TCAP * TOPK / kTile <= kMaxTiles, "the NIC transport takes at most 64 tokens per rank");
+        TORCH_CHECK(EL + world * TCAP * TOPK / kTile <= kMaxTiles,
+                    "too many tokens per rank for the NIC transport: local experts + world * tokens * top-k / 8 must be at most ",
+                    kMaxTiles);
         g.st_route = o; o = align_up(o + 2 * size_t(world) * EL * 4);
         g.st_row = o; o = align_up(o + size_t(world) * TCAP * TOPK * pool_rx(H));
         g.st_comb = o; o = align_up(o + size_t(world) * TCAP * TOPK * H * 2);
@@ -1866,5 +1879,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("probe_signal_base") = kSigProbe;
     m.attr("probe_signal_stride") = kProbeSigStride;
     m.attr("max_world") = kMaxWorld;
+    m.attr("max_local_experts") = kMaxEl;
+    m.attr("max_tiles") = kMaxTiles;
     m.attr("nvfp4") = bool(kNv);
 }

@@ -70,6 +70,23 @@ DP=16 OTHER_HOSTS=10.6.142.1 CLIENT_DIR=/path/nvidia_decode_client_20261111 DATA
 - 多机时 engram 表每台机器一份（各机 local rank 0 建共享内存，本机 rank 分摊加载）。
 - 测试时间：服务起来约 10 分钟，gsm8k 约 2 分钟，decode bench 约 25 分钟（预热占大部分）。
 
+### 17–32 个 rank（例如四台机器 EP32）
+
+`kernel/` 的默认构建最多 16 个 rank。group 超过 16 个 rank 时 `sm120_fp4.py` 自动换用 `_w32` 构建：同一份源码加
+`-DSM120_FP4_MAX_WORLD=32 -DSM120_FP4_MAX_TILES=6400`，扩展名和缓存子目录带 `_w32` 后缀，16 个 rank 以内的构建不变。
+
+| | 默认构建 | `_w32` 构建 |
+|---|---|---|
+| rank 数 | ≤ 16 | 17–32 |
+| 每 rank 本地专家数（`kMaxEl`） | ≤ 256 | ≤ 128 |
+| 工作项表（`kMaxTiles`，走网卡时要求 本地专家数 + rank 数 × 每 rank token 数 × top-k / 8 不超过它） | 2304 | 6400 |
+
+- DeepSeek-V4.1 的 top-6 在 EP32、每卡 13 个专家（384 + 32 个副本）时，每 rank 的 token 上限是 266。SGLang 侧的上限检查
+  （`mega_moe_sm120.py`）按所用构建的 `kMaxTiles` 计算（`sm120_fp4.max_tiles(world)`）。
+- `launch.sh` 用 `NNODES=4` 起 EP32。本目录没有 EP32 的 EPLB 放置文件，`EPLB=1` 时要给 `EPLB_MAP=<文件> REDUNDANT=<副本数>`
+  （放置与负载和卡数有关，要在同样的卡数上重新统计）。
+- 仓库自带的测试直接可用：`torchrun --nnodes 4 --nproc-per-node 8 ... kernel/tests/test_mega_moe_sm120_fp4.py verify w4a8_rm all_gin`。
+
 ## SGLang 版本
 
 公开镜像 `lmsysorg/sglang:v0.5.22-cu130`，SGLang commit `baa9befa381511cd4d56f83980951e5a45fffc6d`（0.5.22）。

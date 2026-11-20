@@ -26,7 +26,7 @@
 # Two hosts (EP16 / DP16), on both at once, node rank 0 first: NNODES=2 NODE_RANK=0|1 MASTER=<node rank 0's address>
 # (reachable from every host); DIST_PORT (its rendezvous port, default 29661), IFNAME (bootstrap interface, default bond0).
 # EPLB=1: SGLang's EPLB places the main model's experts from eplb_map_r8_ep8.pt (EP8, 384 experts + 8 replicas) or, with
-# NNODES=2, eplb_map_r16_ep16.pt (EP16, + 16 replicas); another
+# NNODES=2, eplb_map_r16_ep16.pt (EP16, + 16 replicas); NNODES=4 (EP32: the kernel's '_w32' build, README.md) has none here; another
 # placement: EPLB_MAP (host .pt, {'physical_to_logical_map'} or {'logical_count'}) and REDUNDANT (its replica count).
 # FUSED_ROUTER=1 (MEGA=1, not with CAKE=1): the SM120 kernel routes from the gate logits itself (DeepSeek-V4.1's
 # router: sqrtsoftplus, correction bias, bias_vl for image tokens, top-k, renormalize, routed scaling, EPLB replica
@@ -49,6 +49,9 @@ ENVS=(-e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1)
 DEV=()
 EPLB_MAP=${EPLB_MAP:-$([ "${EPLB:-0}" = 1 ] && echo "$HERE/eplb_map_r${WORLD}_ep${WORLD}.pt")}
 EPLB_VOL=() EPLB_ARGS=""
+if [ -n "$EPLB_MAP" ] && [ ! -f "$EPLB_MAP" ]; then
+  echo "EPLB placement file not found: $EPLB_MAP (set EPLB_MAP and REDUNDANT; this directory has EP8 and EP16 only)" >&2; exit 1
+fi
 if [ -n "$EPLB_MAP" ]; then
   EPLB_VOL=(-v "$EPLB_MAP":/opt/eplb_map.pt:ro)
   EPLB_ARGS="--init-expert-location /opt/eplb_map.pt --ep-num-redundant-experts ${REDUNDANT:-$WORLD}"
