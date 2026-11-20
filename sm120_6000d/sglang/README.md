@@ -46,7 +46,7 @@ docker rm -f dsv41_sglang                        # 停掉
 
 `EPLB=1` 用的放置文件是在本文的测试数据上统计的，只用来复现本文结果；实际部署要在自己的负载上重新统计，见“启动”一节的 EPLB 说明。
 
-### 两台机器，EP16，主模型 MoE 全走 FlashInfer Cake（最快）
+### 两台机器，EP16，主模型 MoE 全走 FlashInfer Cake
 
 两台 8 卡机器（测试用 .6 + .1，CX8aaS），TP16 / DP16 attention / EP16。主模型的 MoE（prefill 和 decode，包括 CUDA graph）
 全部走 FlashInfer 的 Cake SM120 MegaMoE，DSPARK draft 模型的 MoE 仍走本仓库 kernel。另外需要：
@@ -66,7 +66,7 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 DP=16 OTHER_HOSTS=10.6.142.1 CLIENT_DIR=/path/nvidia_decode_client_20261111 DATA=/path/public_pg19_all.jsonl.gz bash bench_bs16.sh
 ```
 
-- `EPLB=1` 在 `NNODES=2` 时用 `eplb_map_r16_ep16.pt`（`{'logical_count'}`，同一个 decode bench 上统计），384 个专家加 16 个副本，每卡 25 个；同样只是示例，实际使用要重新统计。
+- `EPLB=1` 在 `NNODES=2` 时用 `eplb_map_r16_ep16.pt`（`{'physical_to_logical_map'}`，同一个 decode bench 上统计），384 个专家加 16 个副本，每卡 25 个；同样只是示例，实际使用要重新统计。
 - `CAKE_MAX_TOKENS` 默认 2048，即 SGLang 每 rank 的 prefill 分块（`--chunked-prefill-size` = 2048 × 16）；设到 16384 时 EP8 上 Cake 的通信缓冲区分配（`ncclMemAlloc`）失败。
 - `--mem-fraction-static 0.66`：EP16 时 Cake 和 NCCL 的缓冲区约占 14 GB 显存，0.8 / 0.76 会在 indexer 处 OOM；KV 池仍远大于测试所需。
 - 多机时 engram 表每台机器一份（各机 local rank 0 建共享内存，本机 rank 分摊加载）。
@@ -121,7 +121,7 @@ router（gate + topk）用 SGLang 自己的，结果传给 kernel。主模型和
 MODEL_DIR=/raid/models bash launch.sh                  # MegaMoE，卡间全走 PCIe P2P
 MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable bash launch.sh   # MegaMoE，NCCL 映射不了 P2P 的卡间走网卡（CX8aaS）
 MODEL_DIR=/raid/models MEGA=0 bash launch.sh           # 基线：原版 FlashInfer MoE（只带启动修复）
-MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # 再开 EPLB（8 个冗余专家），最快；MEGA=0 也能加
+MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 bash launch.sh   # 再开 EPLB（8 个冗余专家）；MEGA=0 也能加
 MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash launch.sh   # FP8 GEMM 和 indexer 用 SGLang 自带的
 ```
 
@@ -192,7 +192,7 @@ kernel 每次调用给所有专家用同一个宽度：8、16 或 32 个 token �
 | 64（8）| 781 / **690** / 691（.6 `lsa_where_reachable`：16 754，32 727）| 737 / 669 / **664** |
 | 96（12）| 924 / 800 / **792** | 893 / 797 / **792** |
 
-由此这份数据上取 `w4a8_rm` `TILE_SPLITS=2,8`、packed `TILE_SPLITS=4,8`（e = 每 rank token × 6 / 48）：每 rank 32–96 token 比均衡默认快 1–10%，均衡路由下慢 1–3%。下文“结果”的表都在每 rank 96 token 用 32-token item，复现时设 `TILE_SPLITS=2,8`。
+packed 一列是 16 / 32-token item 加跳过空子块之前测的，`4,8` 还没用当前代码重测。由此这份数据上取 `w4a8_rm` `TILE_SPLITS=2,8`、packed `TILE_SPLITS=4,8`（e = 每 rank token × 6 / 48）：每 rank 32–96 token 比均衡默认快 1–10%，均衡路由下慢 1–3%。下文“结果”的表都在每 rank 96 token 用 32-token item，复现时设 `TILE_SPLITS=2,8`。
 
 自己调：在要部署的负载上记录每次 MoE 调用的 top-k 专家号（每个 rank 一个 `rank<r>.pt`：`[(step, 每 rank 行数, ids [行数, top-k] 逻辑专家号), ...]`，再加一个 `{'physical_to_logical_map'}` 放置文件，不开 EPLB 时为恒等），然后逐个宽度测：
 
@@ -223,7 +223,7 @@ docker exec dsv41_sglang python3 -m sglang.test.few_shot_gsm8k --host 127.0.0.1 
 两台机器 EP16（.6 + .1，`lsa_where_reachable` + 8 网卡，EPLB 16 个冗余专家，`DENSE_OPT=1`）：每 rank BS16，全局 256 条，
 每 rank 平均输入 100K，其余与下表客户端设置相同，缓存命中 99.87%。两列同一天、同两台机器、同一测法。
 
-| | EP16，主模型 MoE 走本仓库 kernel | EP16，主模型 MoE 全走 Cake（最快）|
+| | EP16，主模型 MoE 走本仓库 kernel | EP16，主模型 MoE 全走 Cake |
 |---|---|---|
 | TPOT P50 / 平均 / P95 (ms) | 31.7 / 31.6 / 42.3 | **30.9 / 31.0 / 40.4** |
 | 全部输出 tok/s（16 卡）| 8461 | **8791** |
@@ -247,7 +247,7 @@ Cake 这一列 gsm8k（1319 题，256 并发）0.901。
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
 ² 当时 FP8 线性层全走 CUTLASS（`SGLANG_SM120_MXFP8_B12X_MIN_N=0`）。基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。
 每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
-³ 当前 kernel（激活值暂存到共享内存，每 rank 96 token（每专家平均 12 个）用 32-token item），kernel 内路由：每步间隔（SSE gap）P50 63.9 ms，
+³ 测时的 kernel 在每 rank 96 token（每专家平均 12 个）用 32-token item，激活值暂存到共享内存（相当于现在设 `TILE_SPLITS=2,8`；现在的默认在这里用 16-token item，未做端到端测试），kernel 内路由：每步间隔（SSE gap）P50 63.9 ms，
 接受长度 2.39、draft 接受率 27.9%。不开 kernel 内路由（`FUSED_ROUTER=0`）31.5 / 30.3 / 40.9 ms、4430 tok/s、64.9 ms。上一版 kernel 同配置 33.1 / 32.7 / 43.7 ms、3989 tok/s、每步间隔 P50 69.5 ms；FlashInfer Cake（主模型
 MoE 全走 Cake，`--mem-fraction-static 0.76`）同配置 34.9 / 33.6 / 41.4 ms、4085 tok/s、70.5 ms。
 按 10 步 profile，FP8 GEMM 每步 10.8 → 7.5 ms（`b12x`），整步 72.9 → 69.6 ms，其余部分不变。

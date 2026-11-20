@@ -420,7 +420,7 @@ index 0000000..bd55f46
 +FC1 + SwiGLU + FC2 there and combines the partials back here. Larger calls take
 +the configured path. The kernel reads the FP4 weights FlashInfer holds (the
 +checkpoint's row-major layout) and keeps its own copy of the UE8M0 scales. With SGLANG_SM120_MEGA_MOE_PACKED=1 the main
-+model's weights move to the kernel's packed 'w4a8' layout at load (in place, ~12% faster decode MoE); FlashInfer's
++model's weights move to the kernel's packed 'w4a8' layout at load (in place; not measured end to end); FlashInfer's
 +calls then read a layer's row-major weights rebuilt into one shared scratch buffer (~1.4 ms per layer). With SGLANG_SM120_CAKE_PREFILL=1 the main model's
 +larger calls (up to SGLANG_SM120_CAKE_MAX_TOKENS per rank) run FlashInfer's Cake SM120 MegaMoE instead (the moe_ep
 +backend sm120_mxfp4_mxfp8_bf16_cake; needs FlashInfer main): its W2 is FlashInfer's, its interleaved W13 is rebuilt
