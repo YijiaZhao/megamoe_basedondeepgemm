@@ -430,6 +430,88 @@ __device__ __forceinline__ void quad_transpose(uint32_t (&v)[4], int c) {
     }
 }
 
+// item_gemm_rm for single-N8 items (NT 1): no staging and no CTA barrier per K step; each
+// warp reads its lane's token (xrow / xsrow: token g's value row / scale words) where it uses it, and loads the
+// weights one K step ahead, as item_gemm's single-N8 path. Only sub-tile 0 is computed; the others stay zero.
+template <int NT>
+__device__ __forceinline__ void item_gemm_rm_direct(float (&acc)[kNbPerWarp][NT][4], const uint8_t *W, const uint32_t *WS,
+                                                    int nb0, int rpb, int roff, int K, const uint8_t *xrow,
+                                                    const uint32_t *xsrow, int lane) {
+    const int g = lane / 4, c = lane % 4;
+    const int kch = K / 64, kw = K / kSfWordK;
+    const uint4 *wp[kNbPerWarp][2];
+    const uint32_t *sp[kNbPerWarp];
+#pragma unroll
+    for (int j = 0; j < kNbPerWarp; ++j) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+            wp[j][r] = reinterpret_cast<const uint4 *>(W + ptrdiff_t((nb0 + j) * rpb + g + r * roff) * (K / 2)) + c;
+        sp[j] = WS + size_t(nb0 + j) * kw * 16 + g + (lane & 1) * 8;
+    }
+#pragma unroll
+    for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+        for (int s = 0; s < NT; ++s) acc[j][s][0] = acc[j][s][1] = acc[j][s][2] = acc[j][s][3] = 0.f;
+    constexpr int kSw = kUnroll / 2, kQ = kUnroll / 2;
+    const uint2 *xp = reinterpret_cast<const uint2 *>(xrow) + c;
+    uint4 wq[kNbPerWarp][kQ][2], wn[kNbPerWarp][kQ][2];
+    uint32_t sfa[kNbPerWarp][kSw], sfn[kNbPerWarp][kSw];
+    auto load = [&](int k0, uint4 (&q)[kNbPerWarp][kQ][2], uint32_t (&sf)[kNbPerWarp][kSw]) {
+#pragma unroll
+        for (int p = 0; p < kQ; ++p)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+                for (int r = 0; r < 2; ++r) q[j][p][r] = __ldcs(wp[j][r] + (k0 / 2 + p) * 4);
+#pragma unroll
+        for (int s = 0; s < kSw; ++s)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = __ldg(sp[j] + (k0 / 2 + s) * 16);
+    };
+    load(0, wq, sfa);
+#pragma unroll 2
+    for (int k0 = 0; k0 < kch; k0 += kUnroll) {
+        if (k0 + kUnroll < kch) load(k0 + kUnroll, wn, sfn);
+        uint32_t wv[kNbPerWarp][kUnroll][2][2];  // [block][K64 chunk][K32 step][row g / g + 8]
+#pragma unroll
+        for (int p = 0; p < kQ; ++p)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    uint32_t v[4] = {wq[j][p][r].x, wq[j][p][r].y, wq[j][p][r].z, wq[j][p][r].w};
+                    quad_transpose(v, c);
+#pragma unroll
+                    for (int b = 0; b < 4; ++b) wv[j][p * 2 + b / 2][b % 2][r] = v[b];
+                }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const int kc = k0 + u;
+            const uint32_t xsf = xsrow[kc / 2];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint16_t sel = uint16_t((kc * 2 + h) & 3);
+                const uint2 x = xp[(kc * 2 + h) * 4];  // bytes 8c..8c+7 of the K32 step
+                const uint32_t b0 = __byte_perm(x.x, x.y, 0x6420u), b1 = __byte_perm(x.x, x.y, 0x7531u);
+#pragma unroll
+                for (int j = 0; j < kNbPerWarp; ++j) {
+                    uint32_t wa[4];
+                    expand(wv[j][u][h][0], wa[0], wa[2]);
+                    expand(wv[j][u][h][1], wa[1], wa[3]);
+                    mma_w4a8(acc[j][0], wa, b0, b1, sfa[j][u / 2], sel, xsf, sel);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j) {
+#pragma unroll
+            for (int p = 0; p < kQ; ++p) wq[j][p][0] = wn[j][p][0], wq[j][p][1] = wn[j][p][1];
+#pragma unroll
+            for (int s = 0; s < kSw; ++s) sfa[j][s] = sfn[j][s];
+        }
+    }
+}
+
 // item_gemm on row-major weights (W4A8, SM120_FP4_RM): W [rows][K/2] bytes, low nibble first. Row g of block nb is
 // row nb * rpb + g, row g + 8 is that + roff (W13: rpb 8, roff I for gate rows then up rows, or W at the gate rows
 // and roff -I for up rows first; W2: rpb 16, roff 8).
@@ -447,6 +529,10 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
                                              const uint32_t *const *xs, uint8_t *sx, uint32_t *ss, int lane, int nsub) {
     constexpr int kT = kTile * NT;
     const int g = lane / 4, c = lane % 4;
+    if constexpr (NT == 1) {  // single N8: each warp reads its activations itself, warps unsynchronized
+        item_gemm_rm_direct<NT>(acc, W, WS, nb0, rpb, roff, K, xr[g], xs[g], lane);
+        return;
+    }
     const int ntk = (NT == 1 ? 1 : nsub) * kTile;
     auto stage = [&](int k0, int b) {
         for (int u = threadIdx.x; u < ntk * (kStageB / 16); u += blockDim.x) {
@@ -1762,14 +1848,15 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     a.swiglu_limit = float(swiglu_limit);
     TORCH_CHECK(!w13_up_first || kRm, "w13_up_first: row-major weights ('w4a8_rm') only");
     a.w13_up_first = int(w13_up_first);
-    // tokens per item: 0 = automatic. Row-major W4A8: 32 from 32 tokens per rank (real routing piles many tokens on a
-    // few experts; 6000D EP8 DSV4.1 at 96 per rank: 902 -> 844 us), 16 below (1-8 per rank: 7-15 us faster than 32);
-    // a tile skips its empty sub-tiles. Other formats: from the expected tokens per local expert (this rank's T,
-    // uniform routing), 8 while one sub-tile holds them, 16 beyond
+    // tokens per item: 0 = automatic. Row-major W4A8, from DSV4.1's real routing (EP8, 6000D P2P): 8 below 32 tokens
+    // per rank (the unsynchronized single-N8 path; 1 per rank: 157 vs 165 us at 16), 16 below 96 (32 per rank: 554 vs
+    // 583 us at 8), 32 from 96 (real routing piles many tokens on a few experts: 792 vs 800 us at 16); a tile skips its
+    // empty sub-tiles. Other formats: from the expected tokens per local expert (this rank's T, uniform routing), 8
+    // while one sub-tile holds them, 16 beyond
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
         const float per_expert = float(a.T) * a.TOPK / a.EL;
-        nt = kRm ? (a.T >= 32 ? 4 : 2) : per_expert > 8.f ? 2 : 1;
+        nt = kRm ? (a.T >= 96 ? 4 : a.T >= 32 ? 2 : 1) : per_expert > 8.f ? 2 : 1;
     }
     TORCH_CHECK((nt == 1 || nt == 2 || nt == 4) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
                 "tile_tokens: 8, 16 or 32");

@@ -1,6 +1,6 @@
 # DSV4.1-Flash MegaMoE on real routing: replays the top-6 expert ids SGLang's verify steps produced (96 tokens per rank,
 # EP8), mapped to physical experts through an EPLB placement, one CUDA graph per call, cold L2 (256 MB written before
-# each replay), median of 20 replays; the per-call time is the slowest rank's. 'stamps' prints the per-phase
+# each replay), median of 20 replays; the per-call time is the slowest rank's. TILE=8/16/32 forces the tokens per item; ROWS=n keeps each call's first n tokens per rank. 'stamps' prints the per-phase
 # globaltimer stamps (rank 0 and the slowest rank) of the first call instead.
 #   torchrun --nproc_per_node=8 tests/bench_real_routing.py <fmt> <transport> <dump dir> <placement .pt> [calls] [stamps]
 # dump dir: rank<r>.pt = list of (step, rows per rank, ids [rows, 6] logical); placement: {'physical_to_logical_map':
@@ -46,13 +46,16 @@ def main():
     for n, (step, _, ids_l) in enumerate(calls):
         layer = (first + n) % 40
         ids = ids_l.long()
+        if os.environ.get('ROWS'):  # the call's first ROWS tokens per rank (smaller batches, same routing)
+            ids = ids[:int(os.environ['ROWS'])]
         ids = torch.where(ids >= 0, l2p[layer][ids.clamp_min(0)], ids).int().cuda()
         t = ids.shape[0]
         x = (torch.randn(t, h, device='cuda', generator=gen) * 0.1).bfloat16()
         wts = torch.full((t, topk), 1.0 / topk, device='cuda')
         y = torch.empty(t, h, device='cuda', dtype=torch.bfloat16)
         st = torch.zeros(4096, 16, dtype=torch.int64, device='cuda') if stamps else None
-        run = lambda: fp4.fp4_mega_moe_sm120(y, x, ids, wts, l1, l2, buf, None, activation_clamp=LIMIT, stamps=st)
+        run = lambda: fp4.fp4_mega_moe_sm120(y, x, ids, wts, l1, l2, buf, None, activation_clamp=LIMIT,
+                                             tile_tokens=int(os.environ.get('TILE', '0')), stamps=st)
         for _ in range(2):
             run()
         torch.cuda.synchronize()
