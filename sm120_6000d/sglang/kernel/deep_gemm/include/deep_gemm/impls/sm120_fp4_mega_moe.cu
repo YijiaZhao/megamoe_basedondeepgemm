@@ -1985,14 +1985,17 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     a.swiglu_limit = float(swiglu_limit);
     TORCH_CHECK(!w13_up_first || kRm, "w13_up_first: row-major weights ('w4a8_rm') only");
     a.w13_up_first = int(w13_up_first);
-    // tokens per item: 0 = automatic, from the expected tokens per local expert (this rank's T, uniform routing), the
-    // best width under uniform routing (6000D EP8, DSV4.1 and README shapes, every W4A8 format): 8 below 8 per expert,
-    // 16 from 8 (32 is no faster there: README shape at 96 per rank 331 vs 343 us). Skewed routing favours wider items
-    // earlier: sm120_fp4.py's DG_SM120_MEGA_MOE_TILE_SPLITS passes tile_tokens from other thresholds (README.md).
-    // 8-token items take the unsynchronized single-N8 paths; W4A8's wider items stage the activations and skip their
-    // empty sub-tiles (item_gemm_rm / item_gemm_pk).
+    // tokens per item: 0 = automatic, from the expected tokens per local expert e = T * TOPK / EL, with thresholds
+    // measured offline on DeepSeek-V4.1's real routing (6000D EP8, P2P and lsa_where_reachable, every W4A8 format):
+    // 8 below e 2, 16 below 8, else 32 (real routing piles many tokens on a few experts, so wider items pay off earlier
+    // than under uniform routing; another workload should measure its own, README.md). 8-token items take the
+    // unsynchronized single-N8 paths; W4A8's wider items stage the activations and skip their empty sub-tiles
+    // (item_gemm_rm / item_gemm_pk).
     int nt = int(tile_tokens) / kTile;
-    if (tile_tokens <= 0) nt = float(a.T) * a.TOPK / a.EL >= 8.f ? 2 : 1;
+    if (tile_tokens <= 0) {
+        const float per_expert = float(a.T) * a.TOPK / a.EL;
+        nt = per_expert >= 8.f ? 4 : per_expert >= 2.f ? 2 : 1;
+    }
     TORCH_CHECK((nt == 1 || nt == 2 || nt == 4) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
                 "tile_tokens: 8, 16 or 32");
     auto stream = c10::cuda::getCurrentCUDAStream();

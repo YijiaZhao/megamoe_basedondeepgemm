@@ -27,10 +27,6 @@ _IMPLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_IMPLS, 'sm120_fp4_mega_moe.cu')
 _GIN_SRC = os.path.join(_IMPLS, 'sm120_fp4_mega_moe_gin.cu')  # NIC transport session (host only)
 FORMATS = {'mxfp4': 32, 'nvfp4': 16, 'w4a8': 32, 'w4a8_rm': 32}  # format -> values per block scale
-# DG_SM120_MEGA_MOE_TILE_SPLITS="a,b": tokens per work item from the call's expected tokens per local expert
-# e = T * top-k / local experts, 8 below a, 16 below b, else 32 (instead of the kernel's uniform-routing choice)
-_TILE_SPLITS = tuple(float(v) for v in os.environ.get('DG_SM120_MEGA_MOE_TILE_SPLITS', '').split(',') if v.strip())
-assert len(_TILE_SPLITS) in (0, 2), 'DG_SM120_MEGA_MOE_TILE_SPLITS: "a,b"'
 # 'p2p': every peer over PCIe P2P (cudaIpc). Otherwise the buffer is one NCCL window and a per-pair transport table
 # (sm120_fp4_transport.py, the rules of FlashInfer's Cake SM120 MegaMoE) says which pairs use P2P stores (LSA) and
 # which NCCL GIN puts through the NIC. Which pairs can use P2P at all is NCCL's peer mapping of the window (e.g. on the
@@ -365,9 +361,9 @@ def fp4_mega_moe_sm120(y: torch.Tensor,
     expert ids (-1 = skip), `topk_weights` [T, K]; `y` [T, H] bf16 receives the combined output. Weights are this
     rank's experts from `transform_fp4_weights_for_mega_moe_sm120`; 'nvfp4' also takes `nvfp4_global_scales`.
     `tile_tokens`: tokens per work item (8 / 16 / 32; each weight fragment feeds that many tokens), 0 = chosen from
-    the expected tokens per local expert e: 8 below 8, else 16 (uniform routing), or
-    with DG_SM120_MEGA_MOE_TILE_SPLITS="a,b" 8 below a, 16 below b, else 32 (skewed routing, README.md); 16 / 32-token
-    items skip their empty 8-token sub-tiles. `w13_up_first`: as given to the weight transform ('w4a8_rm').
+    the expected tokens per local expert e = T x top-k / local experts: 8 below 2, 16 below 8, else 32 (measured on
+    DeepSeek-V4.1's real routing, README.md); 16 / 32-token items skip their empty 8-token sub-tiles. `w13_up_first`:
+    as given to the weight transform ('w4a8_rm').
     In-kernel router (DeepSeek-V4.1, SGLang's moe_fused_gate with sqrtsoftplus via log1p): with `router_logits`
     ([T, E] or [slices, T, E] fp32 gate logits, E <= 384 logical experts), the kernel routes first and `topk_idx` /
     `topk_weights` (int32 / fp32 [T, K], contiguous) receive the routes: score + `router_bias` ranks (`router_bias_alt`
@@ -376,9 +372,6 @@ def fp4_mega_moe_sm120(y: torch.Tensor,
     Every rank of the group must call it."""
     assert x.shape[0] <= sym_buffer.num_max_tokens_per_rank
     assert (global_scales is not None) == (sym_buffer.fmt == 'nvfp4')
-    if tile_tokens <= 0 and _TILE_SPLITS:
-        e = x.shape[0] * sym_buffer.num_topk / sym_buffer.num_local_experts
-        tile_tokens = 8 if e < _TILE_SPLITS[0] else 16 if e < _TILE_SPLITS[1] else 32
     if router_logits is not None:
         assert topk_idx.dtype == torch.int32 and topk_weights.dtype == torch.float32
         assert topk_idx.is_contiguous() and topk_weights.is_contiguous()

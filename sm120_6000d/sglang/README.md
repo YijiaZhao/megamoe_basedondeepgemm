@@ -178,9 +178,9 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash lau
 
 kernel 每次调用给所有专家用同一个宽度：8、16 或 32 个 token 共用一份读进寄存器的权重。宽的读一遍权重喂更多 token，窄的不做空 token 的计算、可分的活更多。
 
-**代码默认按均衡路由下的最优选**（每专家平均 token 数 e = 本 rank token 数 × top-k / 本地专家数）：e < 8 用 8，e ≥ 8 用 16（均衡路由下 32 没有更快）。8-token item 走不同步的直读路径；W4A8 的 16 / 32-token item（`w4a8_rm` 和 packed `w4a8`）激活值暂存到共享内存，跳过空的 8-token 子块。
+宽度按每专家平均 token 数 e = 本 rank token 数 × top-k / 本地专家数选（`sm120_fp4_mega_moe.cu` 的 `run()`，所有格式相同）：e < 2 用 8，2 ≤ e < 8 用 16，e ≥ 8 用 32。8-token item 走不同步的直读路径；W4A8 的 16 / 32-token item（`w4a8_rm` 和 packed `w4a8`）激活值暂存到共享内存，跳过空的 8-token 子块。
 
-**真实路由要在自己的数据上重新调。** 真实路由会把很多 token 堆到少数专家上，宽 tile 往往更早划算；偏斜程度随模型、负载、卡数、传输方式变，代码里的默认值不保证最优。用 `TILE_SPLITS="a,b"`（`launch.sh`，即容器里的 `DG_SM120_MEGA_MOE_TILE_SPLITS`）按同一个 e 指定：e < a 用 8，e < b 用 16，否则 32（默认相当于 `8,∞`）。
+**这组阈值是在 DeepSeek-V4.1 的真实路由上离线测出来的**（见下表）。真实路由会把很多 token 堆到少数专家上，宽 tile 比均衡路由下更早划算（均衡路由下 e ≥ 8 时 16 比 32 快 1–3%）。偏斜程度随模型、负载、卡数、传输方式变，别的部署要按本节最后的方法在自己的数据上重测，改 `run()` 里那一行。
 
 例子：DeepSeek-V4.1-Flash 本仓库测试的真实路由（SGLang verify 的 top-6 记录，EP8，6000D，不开 EPLB，冷 L2），kernel 单层时间（最慢 rank 的均值，µs），粗体为最快；.20 全 P2P / .6 `lsa_where_reachable`：
 
@@ -194,7 +194,7 @@ kernel 每次调用给所有专家用同一个宽度：8、16 或 32 个 token �
 | 64（8）| 765 / **676** / **676** | 824 / 754 / **727** | 737 / 658 / **642** | 788 / 718 / **698** |
 | 96（12）| 922 / 799 / **792** | 999 / 888 / **833** | 892 / 776 / **744** | 947 / 828 / **794** |
 
-两种格式、两台机器的切换点相同：这份数据上取 `TILE_SPLITS=2,8`（e = 每 rank token × 6 / 48）：每 rank 16–96 token 比均衡默认快 1–10%，均衡路由下慢 1–3%。
+两种格式、两台机器的切换点相同（e = 每 rank token × 6 / 48）：e ≤ 1 用 8，e = 2–4 用 16，e ≥ 8 用 32，即上面的阈值。
 
 自己调：在要部署的负载上记录每次 MoE 调用的 top-k 专家号（每个 rank 一个 `rank<r>.pt`：`[(step, 每 rank 行数, ids [行数, top-k] 逻辑专家号), ...]`，再加一个 `{'physical_to_logical_map'}` 放置文件，不开 EPLB 时为恒等），然后逐个宽度测：
 
@@ -202,7 +202,7 @@ kernel 每次调用给所有专家用同一个宽度：8、16 或 32 个 token �
 TILE=8 ROWS=32 torchrun --nproc_per_node=8 kernel/tests/bench_real_routing.py w4a8_rm p2p <dump 目录> <放置文件> 160:200
 ```
 
-`TILE` 强制宽度，`ROWS=n` 只取每次调用的前 n 个 token（同一份路由模拟更小的 batch）。对每个 batch 取最快的宽度，换算成 e 定出 a、b。
+`TILE` 强制宽度，`ROWS=n` 只取每次调用的前 n 个 token（同一份路由模拟更小的 batch）。对每个 batch 取最快的宽度，换算成 e 定阈值。
 
 ## 测速与精度
 
@@ -249,7 +249,7 @@ Cake 这一列 gsm8k（1319 题，256 并发）0.901。
 ¹ .20 是上一版测的：draft 模型的 MoE 还走 FlashInfer，kernel 是 `c9c8835`。
 ² 当时 FP8 线性层全走 CUTLASS（`SGLANG_SM120_MXFP8_B12X_MIN_N=0`）。基线列沿用 .6 的 EPLB 基线（同机型，未在 .1 上重测）。
 每步间隔（SSE gap 平均）72.4 ms，`DENSE_OPT=0` 时 96.0 ms；按 10 步 profile，FP8 GEMM 每步 30.7 → 10.4 ms，indexer 打分加 slot 表约 13.4 → 7.3 ms。
-³ 测时的 kernel 在每 rank 96 token（每专家平均 12 个）用 32-token item，激活值暂存到共享内存（相当于现在设 `TILE_SPLITS=2,8`；现在的默认在这里用 16-token item，未做端到端测试），kernel 内路由：每步间隔（SSE gap）P50 63.9 ms，
+³ 测时的 kernel 在每 rank 96 token（每专家平均 12 个）用 32-token item，激活值暂存到共享内存（和现在的阈值相同），kernel 内路由：每步间隔（SSE gap）P50 63.9 ms，
 接受长度 2.39、draft 接受率 27.9%。不开 kernel 内路由（`FUSED_ROUTER=0`）31.5 / 30.3 / 40.9 ms、4430 tok/s、64.9 ms。上一版 kernel 同配置 33.1 / 32.7 / 43.7 ms、3989 tok/s、每步间隔 P50 69.5 ms；FlashInfer Cake（主模型
 MoE 全走 Cake，`--mem-fraction-static 0.76`）同配置 34.9 / 33.6 / 41.4 ms、4085 tok/s、70.5 ms。
 按 10 步 profile，FP8 GEMM 每步 10.8 → 7.5 ms（`b12x`），整步 72.9 → 69.6 ms，其余部分不变。
