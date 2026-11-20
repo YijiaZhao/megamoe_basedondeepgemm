@@ -362,7 +362,7 @@ def fp4_mega_moe_sm120(y: torch.Tensor,
     rank's experts from `transform_fp4_weights_for_mega_moe_sm120`; 'nvfp4' also takes `nvfp4_global_scales`.
     `tile_tokens`: tokens per work item (8 / 16 / 32; each weight fragment feeds that many tokens), 0 = chosen
     ('w4a8_rm': 8 below 16 tokens per rank, 16 below 64, 32 from 64, a tile skipping its empty sub-tiles; other
-    formats: from the expected tokens per local expert). `w13_up_first`: as given to the weight transform ('w4a8_rm').
+    formats: 8 below 32, 16 below 64, 32 from 64). `w13_up_first`: as given to the weight transform ('w4a8_rm').
     In-kernel router (DeepSeek-V4.1, SGLang's moe_fused_gate with sqrtsoftplus via log1p): with `router_logits`
     ([T, E] or [slices, T, E] fp32 gate logits, E <= 384 logical experts), the kernel routes first and `topk_idx` /
     `topk_weights` (int32 / fp32 [T, K], contiguous) receive the routes: score + `router_bias` ranks (`router_bias_alt`

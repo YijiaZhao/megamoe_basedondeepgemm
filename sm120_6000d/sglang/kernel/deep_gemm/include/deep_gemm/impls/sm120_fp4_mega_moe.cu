@@ -1851,13 +1851,11 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     // tokens per item: 0 = automatic. Row-major W4A8, from DSV4.1's real routing (EP8, 6000D): 8 below 16 tokens per
     // rank (the unsynchronized single-N8 path; 1 per rank: 157 vs 165 us at 16), 16 below 64 (32 per rank: 554 vs 583 us
     // at 8), 32 from 64 (real routing piles many tokens on a few experts; 64 per rank over lsa_where_reachable: 727 vs
-    // 754 us at 16); a tile skips its empty sub-tiles. Other formats: from the expected tokens per local expert (this
-    // rank's T, uniform routing), 8 while one sub-tile holds them, 16 beyond
+    // 754 us at 16); a tile skips its empty sub-tiles. Packed formats (no sub-tile skip), from the same real routing: 8
+    // below 32 tokens per rank, 16 below 64 (32 per rank: 535 vs 553 us at 8), 32 from 64 (64 per rank: 664 vs 737 us
+    // at 8, the expected tokens per expert's old choice)
     int nt = int(tile_tokens) / kTile;
-    if (tile_tokens <= 0) {
-        const float per_expert = float(a.T) * a.TOPK / a.EL;
-        nt = kRm ? (a.T >= 64 ? 4 : a.T >= 16 ? 2 : 1) : per_expert > 8.f ? 2 : 1;
-    }
+    if (tile_tokens <= 0) nt = a.T >= 64 ? 4 : a.T >= (kRm ? 16 : 32) ? 2 : 1;
     TORCH_CHECK((nt == 1 || nt == 2 || nt == 4) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
                 "tile_tokens: 8, 16 or 32");
     auto stream = c10::cuda::getCurrentCUDAStream();
