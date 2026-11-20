@@ -396,7 +396,7 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
     }
 }
 
-#if SM120_FP4_RM
+#if SM120_FP4_A8  // the activation staging (cp.async) and the row-major paths: W4A8 builds
 __device__ __forceinline__ void cp_async16(void *dst, const void *src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(uint32_t(__cvta_generic_to_shared(dst))), "l"(src)
                  : "memory");
@@ -651,6 +651,112 @@ __device__ __forceinline__ void item_gemm_rm(float (&acc)[kNbPerWarp][NT][4], co
         __syncthreads();  // every warp is done with this buffer before the next step stages into it
     }
 }
+
+// item_gemm for packed W4A8 weights on items of 16 or 32 tokens (NT 2 / 4), the way item_gemm_rm runs them: the CTA
+// stages the item's activations (xr / xs, its live sub-tiles only) into sx / ss one K step ahead, the weights are
+// loaded one K step ahead into a second register buffer, and the sub-tiles past the item's tokens (nsub, CTA-uniform)
+// take no MMA. The packed fragments need no transpose: lane L's 16 bytes of a K64 chunk are its A registers of the
+// chunk's two K32 steps (`expand`), its activation words step * 8 + c and + 4 in the natural order. Every thread of the
+// CTA calls it.
+template <int NT>
+__device__ __forceinline__ void item_gemm_pk(float (&acc)[kNbPerWarp][NT][4], const uint4 *W, const uint32_t *WS,
+                                             int nb0, int K, const uint8_t *const *xr, const uint32_t *const *xs,
+                                             uint8_t *sx, uint32_t *ss, int lane, int nsub) {
+    static_assert(NT > 1, "single-N8 items take item_gemm");
+    constexpr int kT = kTile * NT;
+    const int g = lane / 4, c = lane % 4;
+    const int ntk = nsub * kTile;
+    auto stage = [&](int k0, int b) {
+        for (int u = threadIdx.x; u < ntk * (kStageB / 16); u += blockDim.x) {
+            const int tk = u / (kStageB / 16), q = u % (kStageB / 16);
+            cp_async16(sx + (b * kT + tk) * kStageRow + q * 16, xr[tk] + k0 * 64 + q * 16);
+        }
+        for (int tk = threadIdx.x; tk < ntk; tk += blockDim.x)
+            cp_async8(ss + (b * kT + tk) * kStageW, xs[tk] + k0 / 2);
+        cp_async_commit();
+    };
+    const int kch = K / 64, kw = K / kSfWordK;
+    const uint4 *wp[kNbPerWarp];
+    const uint32_t *sp[kNbPerWarp];
+#pragma unroll
+    for (int j = 0; j < kNbPerWarp; ++j) {
+        wp[j] = W + size_t(nb0 + j) * kch * 32 + lane;
+        sp[j] = WS + size_t(nb0 + j) * kw * 16 + g + (lane & 1) * 8;
+    }
+#pragma unroll
+    for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+        for (int s = 0; s < NT; ++s) acc[j][s][0] = acc[j][s][1] = acc[j][s][2] = acc[j][s][3] = 0.f;
+    constexpr int kSw = kUnroll / 2;  // scale words per unrolled step
+    uint4 wv[kNbPerWarp][kUnroll], wn[kNbPerWarp][kUnroll];
+    uint32_t sfa[kNbPerWarp][kSw], sfn[kNbPerWarp][kSw];
+    auto load = [&](int k0, uint4 (&w)[kNbPerWarp][kUnroll], uint32_t (&sf)[kNbPerWarp][kSw]) {
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j) w[j][u] = __ldcs(wp[j] + (k0 + u) * 32);
+#pragma unroll
+        for (int q = 0; q < kSw; ++q)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j) sf[j][q] = __ldg(sp[j] + (k0 / 2 + q) * 16);
+    };
+    stage(0, 0);
+    load(0, wv, sfa);
+#pragma unroll 2
+    for (int k0 = 0; k0 < kch; k0 += kUnroll) {
+        const int buf = (k0 / kUnroll) & 1;
+        if (k0 + kUnroll < kch) {
+            stage(k0 + kUnroll, buf ^ 1);
+            cp_async_wait<1>();
+            load(k0 + kUnroll, wn, sfn);
+        } else {
+            cp_async_wait<0>();
+        }
+        __syncthreads();  // this step's activations staged by every thread
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+            const int kc = k0 + u;
+            uint32_t sfb[NT];
+#pragma unroll
+            for (int s = 0; s < NT; ++s)
+                sfb[s] = s < nsub ? ss[(buf * kT + s * kTile + g) * kStageW + (kc - k0) / 2] : 0u;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int step = kc * 2 + h;
+                const uint16_t sel = uint16_t(step & 3);
+                uint32_t b0[NT], b1[NT];
+#pragma unroll
+                for (int s = 0; s < NT; ++s) {
+                    if (s >= nsub) {  // past the tile's tokens (CTA-uniform)
+                        b0[s] = b1[s] = 0u;
+                        continue;
+                    }
+                    const uint8_t *row = sx + (buf * kT + s * kTile + g) * kStageRow;  // token g of sub-tile s
+                    const uint32_t *x = reinterpret_cast<const uint32_t *>(row) + ((kc - k0) * 2 + h) * 8;
+                    b0[s] = x[c];
+                    b1[s] = x[4 + c];
+                }
+#pragma unroll
+                for (int j = 0; j < kNbPerWarp; ++j) {
+                    uint32_t wa[4];
+                    expand(h ? wv[j][u].z : wv[j][u].x, wa[0], wa[1]);
+                    expand(h ? wv[j][u].w : wv[j][u].y, wa[2], wa[3]);
+#pragma unroll
+                    for (int s = 0; s < NT; ++s)
+                        if (s < nsub) mma_w4a8(acc[j][s], wa, b0[s], b1[s], sfa[j][u / 2], sel, sfb[s], sel);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kNbPerWarp; ++j) {
+#pragma unroll
+            for (int u = 0; u < kUnroll; ++u) wv[j][u] = wn[j][u];
+#pragma unroll
+            for (int q = 0; q < kSw; ++q) sfa[j][q] = sfn[j][q];
+        }
+        __syncthreads();  // every warp is done with this buffer before the next step stages into it
+    }
+}
 #endif
 
 // 8 fp32 -> 8 E2M1 (round to nearest even, saturating), v[0] in the low nibble
@@ -849,9 +955,9 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     __shared__ Map m;
     __shared__ int s_item, s_ok, s_epoch, s_last;
     // L1: [tok][64 inter] / L2: [tok][128 hidden] fp32 / dispatch: one FP4 token row (H/2 + H/kSfVec bytes).
-    // SM120_FP4_RM: the same bytes hold item_gemm_rm's activation staging while an item's GEMM runs (the epilogues use
-    // s_tile only after it)
-#if SM120_FP4_RM
+    // W4A8: the same bytes hold item_gemm_rm's / item_gemm_pk's activation staging while an item's GEMM runs (the
+    // epilogues use s_tile only after it)
+#if SM120_FP4_A8
     constexpr int kSx = 2 * kT * kStageRow, kSxs = kSx + 2 * kT * kStageW * 4;
     constexpr int kRaw = kT * kRowsPerItem * 4 > kSxs ? kT * kRowsPerItem * 4 : kSxs;
 #else
@@ -859,7 +965,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
 #endif
     __shared__ __align__(16) uint8_t s_raw[kRaw];
     auto s_tile = reinterpret_cast<float (*)[kRowsPerItem]>(s_raw);
-#if SM120_FP4_RM
+#if SM120_FP4_A8
     uint8_t *const s_sx = s_raw;
     uint32_t *const s_ss = reinterpret_cast<uint32_t *>(s_raw + kSx);
     __shared__ const uint8_t *s_xr[kT];  // the item's token rows: values / scale words
@@ -1227,15 +1333,31 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                                  a.ws13 + el * ws13_expert, nb0, 8, a.w13_up_first ? -I : I, H, s_xr, s_xs, s_sx, s_ss,
                                  lane, (ntok + kTile - 1) / kTile);
 #else
+#if SM120_FP4_A8
+                if constexpr (NT > 1) {  // packed W4A8, 16 / 32-token items: staged, empty sub-tiles skipped
+                    if (threadIdx.x < kT) {
+                        int w, i;
+                        token_src(m, el, tile * kT + (int(threadIdx.x) < ntok ? int(threadIdx.x) : 0), W, w, i);
+                        const uint8_t *row = row_ptr(el, w, i);
+                        s_xr[threadIdx.x] = row;
+                        s_xs[threadIdx.x] = reinterpret_cast<const uint32_t *>(row + H / kXB);
+                    }
+                    __syncthreads();
+                    item_gemm_pk<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, s_xr, s_xs, s_sx,
+                                     s_ss, lane, (ntok + kTile - 1) / kTile);
+                } else
+#endif
+                {
 #pragma unroll
-                for (int s = 0; s < NT; ++s) {
-                    int w, i;
-                    token_src(m, el, js[s], W, w, i);
-                    const uint8_t *row = row_ptr(el, w, i);
-                    xr[s] = reinterpret_cast<const uint32_t *>(row);
-                    xs[s] = reinterpret_cast<const uint32_t *>(row + H / kXB);
+                    for (int s = 0; s < NT; ++s) {
+                        int w, i;
+                        token_src(m, el, js[s], W, w, i);
+                        const uint8_t *row = row_ptr(el, w, i);
+                        xr[s] = reinterpret_cast<const uint32_t *>(row);
+                        xs[s] = reinterpret_cast<const uint32_t *>(row + H / kXB);
+                    }
+                    item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
                 }
-                item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
 #endif
                 const float alpha = kNv ? a.gscale[0] * a.gscale[2 + el] : 1.f;
                 // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
@@ -1283,13 +1405,28 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                 item_gemm_rm<NT>(acc, reinterpret_cast<const uint8_t *>(a.w2 + el * w2_expert), a.ws2 + el * ws2_expert,
                                  nb0, 16, 8, I, s_xr, s_xs, s_sx, s_ss, lane, (ntok + kTile - 1) / kTile);
 #else
+#if SM120_FP4_A8
+                if constexpr (NT > 1) {
+                    if (threadIdx.x < kT) {
+                        const int tk = int(threadIdx.x) < ntok ? int(threadIdx.x) : 0;
+                        const size_t r = size_t(el) * TOKE + tile * kT + tk;
+                        s_xr[threadIdx.x] = a.inter + r * (I / kXB);
+                        s_xs[threadIdx.x] = a.inter_s + r * (I / kSfWordK);
+                    }
+                    __syncthreads();
+                    item_gemm_pk<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, s_xr, s_xs, s_sx,
+                                     s_ss, lane, (ntok + kTile - 1) / kTile);
+                } else
+#endif
+                {
 #pragma unroll
-                for (int s = 0; s < NT; ++s) {
-                    const size_t r = size_t(el) * TOKE + js[s];
-                    xr[s] = reinterpret_cast<const uint32_t *>(a.inter + r * (I / kXB));
-                    xs[s] = a.inter_s + r * (I / kSfWordK);
+                    for (int s = 0; s < NT; ++s) {
+                        const size_t r = size_t(el) * TOKE + js[s];
+                        xr[s] = reinterpret_cast<const uint32_t *>(a.inter + r * (I / kXB));
+                        xs[s] = a.inter_s + r * (I / kSfWordK);
+                    }
+                    item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
                 }
-                item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
 #endif
                 const float alpha = kNv ? a.gscale[1] * a.gscale[2 + EL + el] : 1.f;
 #pragma unroll
@@ -1848,14 +1985,14 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     a.swiglu_limit = float(swiglu_limit);
     TORCH_CHECK(!w13_up_first || kRm, "w13_up_first: row-major weights ('w4a8_rm') only");
     a.w13_up_first = int(w13_up_first);
-    // tokens per item: 0 = automatic. Row-major W4A8, from DSV4.1's real routing (EP8, 6000D): 8 below 16 tokens per
-    // rank (the unsynchronized single-N8 path; 1 per rank: 157 vs 165 us at 16), 16 below 64 (32 per rank: 554 vs 583 us
-    // at 8), 32 from 64 (real routing piles many tokens on a few experts; 64 per rank over lsa_where_reachable: 727 vs
-    // 754 us at 16); a tile skips its empty sub-tiles. Packed formats (no sub-tile skip), from the same real routing: 8
-    // below 32 tokens per rank, 16 below 64 (32 per rank: 535 vs 553 us at 8), 32 from 64 (64 per rank: 664 vs 737 us
-    // at 8, the expected tokens per expert's old choice)
+    // tokens per item: 0 = automatic, from the expected tokens per local expert (this rank's T, uniform routing), the
+    // best width under uniform routing (6000D EP8, DSV4.1 and README shapes, every W4A8 format): 8 below 8 per expert,
+    // 16 from 8 (32 is no faster there: README shape at 96 per rank 331 vs 343 us). Skewed routing favours wider items
+    // earlier: sm120_fp4.py's DG_SM120_MEGA_MOE_TILE_SPLITS passes tile_tokens from other thresholds (README.md).
+    // 8-token items take the unsynchronized single-N8 paths; W4A8's wider items stage the activations and skip their
+    // empty sub-tiles (item_gemm_rm / item_gemm_pk).
     int nt = int(tile_tokens) / kTile;
-    if (tile_tokens <= 0) nt = a.T >= 64 ? 4 : a.T >= (kRm ? 16 : 32) ? 2 : 1;
+    if (tile_tokens <= 0) nt = float(a.T) * a.TOPK / a.EL >= 8.f ? 2 : 1;
     TORCH_CHECK((nt == 1 || nt == 2 || nt == 4) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
                 "tile_tokens: 8, 16 or 32");
     auto stream = c10::cuda::getCurrentCUDAStream();

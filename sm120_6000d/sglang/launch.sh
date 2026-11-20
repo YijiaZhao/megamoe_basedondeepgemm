@@ -31,6 +31,9 @@
 # FUSED_ROUTER=1 (MEGA=1, not with CAKE=1): the SM120 kernel routes from the gate logits itself (DeepSeek-V4.1's
 # router: sqrtsoftplus, correction bias, bias_vl for image tokens, top-k, renormalize, routed scaling, EPLB replica
 # pick) instead of SGLang's moe_fused_gate and EPLB remap (SGLANG_SM120_FUSED_ROUTER).
+# TILE_SPLITS="a,b" (MEGA=1): the kernel's tokens per work item from the expected tokens per local expert
+# e = tokens per rank x top-k / local experts, 8 below a, 16 below b, else 32 (DG_SM120_MEGA_MOE_TILE_SPLITS); unset:
+# the uniform-routing choice, 16 from e = 8 (README.md).
 # Extra arguments are appended to the server command line.
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -82,7 +85,7 @@ if [ "$MEGA" = 1 ]; then
          -e SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=128
          -e SGLANG_SM120_MEGA_MOE_DIR=/opt/sm120_megamoe -e DG_SM120_MEGA_MOE_BUILD_DIR=/b
          -e SGLANG_SM120_MEGA_MOE_TRANSPORT=$TRANSPORT -e SGLANG_SM120_MEGA_MOE_PACKED=${PACKED:-0}
-         -e SGLANG_SM120_FUSED_ROUTER=${FUSED_ROUTER:-0})
+         -e SGLANG_SM120_FUSED_ROUTER=${FUSED_ROUTER:-0} -e DG_SM120_MEGA_MOE_TILE_SPLITS=${TILE_SPLITS:-})
   if [ "$TRANSPORT" != p2p ]; then
     # NCCL GIN needs the NCCL Device API, which needs cuMem (SGLang otherwise sets NCCL_CUMEM_ENABLE=0)
     ENVS+=(-e NCCL_CUMEM_ENABLE=1 -e NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7})
