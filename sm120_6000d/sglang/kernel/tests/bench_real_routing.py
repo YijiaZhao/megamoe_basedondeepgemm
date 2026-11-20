@@ -26,7 +26,7 @@ def main():
     dist.init_process_group('nccl', device_id=torch.device('cuda', local))
     rank, world = dist.get_rank(), dist.get_world_size()
     if rank == 0:
-        fp4._ext(fmt)
+        fp4._ext(fmt, world=world)
     dist.barrier()
     h, i, e, topk = SHAPES['dsv41']
     el = e // world

@@ -45,6 +45,9 @@ _GIN_BUILDS = {2: ('proxy', ['-DNCCL_GIN_GDAKI_ENABLE=0', '-DNCCL_GIN_GPI_ENABLE
                3: ('gdaki', ['-DNCCL_GIN_PROXY_ENABLE=0', '-DNCCL_GIN_GPI_ENABLE=0']),
                4: ('gpi', ['-DNCCL_GIN_PROXY_ENABLE=0', '-DNCCL_GIN_GDAKI_ENABLE=0'])}
 _GIN_CONTEXTS = 4  # GIN queue-pair sets the CTAs spread their puts over
+# Groups of up to 16 ranks load the default build (kMaxWorld 16, 256 local experts, kMaxTiles 2304); larger groups, up
+# to 32 ranks, the '_w32' build (kMaxWorld 32, 128 local experts, kMaxTiles 6400): the same source, three constants.
+_WIDE_FLAGS, _WIDE_TAG, _WIDE_TILES, _TILES = ['-DSM120_FP4_MAX_WORLD=32', '-DSM120_FP4_MAX_TILES=6400'], '_w32', 6400, 2304
 _EXT = {}
 _KEY = {}
 
@@ -72,14 +75,26 @@ def _build(name: str, source: str, cflags, nccl: bool):
                 extra_cuda_cflags=['-gencode=arch=compute_120a,code=sm_120a', '-O3', '-std=c++20', *cflags], **extra)
 
 
-def _ext(fmt: str, gin_type: int = 0, slot: int = 0):
+def _wide(world: int) -> bool:
+    return world > 16
+
+
+def max_tiles(world: int) -> int:
+    """The work-item table (kMaxTiles) of the build a group of `world` ranks loads. With a window transport a buffer
+    needs local experts + world * tokens per rank * top-k / 8 of them."""
+    return _WIDE_TILES if _wide(world) else _TILES
+
+
+def _ext(fmt: str, gin_type: int = 0, slot: int = 0, world: int = 0):
     # gin_type: an NCCL GIN type of _GIN_BUILDS (a build with the NIC transport), 0 = P2P only. slot: the extension
-    # keeps one buffer's state (static), so each further buffer of a process (another MoE shape) loads its own copy
-    key = (fmt, gin_type, slot)
+    # keeps one buffer's state (static), so each further buffer of a process (another MoE shape) loads its own copy.
+    # world: the group's size; more than 16 ranks load the '_w32' build
+    wide = _wide(world)
+    key = (fmt, gin_type, slot, wide)
     if key not in _EXT:
         name = f'sm120_fp4_mega_moe_{fmt}' + (f'_gin_{_GIN_BUILDS[gin_type][0]}' if gin_type else '') + \
-            (f'_s{slot}' if slot else '')
-        so = None if gin_type or slot else os.environ.get(f'DG_SM120_FP4_MEGA_MOE_SO_{fmt.upper()}')
+            (f'_s{slot}' if slot else '') + (_WIDE_TAG if wide else '')
+        so = None if gin_type or slot or wide else os.environ.get(f'DG_SM120_FP4_MEGA_MOE_SO_{fmt.upper()}')
         if so:
             spec = importlib.util.spec_from_file_location(name, so)
             _EXT[key] = importlib.util.module_from_spec(spec)
@@ -88,7 +103,8 @@ def _ext(fmt: str, gin_type: int = 0, slot: int = 0):
             gin = ['-DSM120_FP4_GIN=1', '-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE', *_GIN_BUILDS[gin_type][1]] if gin_type else []
             _EXT[key] = _build(name, _SRC, ['--use_fast_math', f'-DSM120_FP4_NV={int(fmt == "nvfp4")}',
                                             f'-DSM120_FP4_A8={int(fmt.startswith("w4a8"))}',
-                                            f'-DSM120_FP4_RM={int(fmt == "w4a8_rm")}', *gin], bool(gin_type))
+                                            f'-DSM120_FP4_RM={int(fmt == "w4a8_rm")}', *gin,
+                                            *(_WIDE_FLAGS if wide else [])], bool(gin_type))
     return _EXT[key]
 
 
@@ -103,10 +119,12 @@ def _transport_module():  # by file path, as the tests load this module
     return _EXT['transport']
 
 
-def _gin_session():
-    if 'session' not in _EXT:
-        _EXT['session'] = _build('sm120_fp4_mega_moe_gin_session', _GIN_SRC, [], True)
-    return _EXT['session']
+def _gin_session(world: int = 0):
+    key = ('session', _wide(world))  # the session asks NCCL for 5 * kMaxWorld GIN signals
+    if key not in _EXT:
+        _EXT[key] = _build('sm120_fp4_mega_moe_gin_session' + (_WIDE_TAG if key[1] else ''), _GIN_SRC,
+                           _WIDE_FLAGS[:1] if key[1] else [], True)
+    return _EXT[key]
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -222,7 +240,7 @@ class Sm120Fp4MegaMoeBuffer:
                num_topk)
         if (fmt, slot) not in _KEY:
             if self.transport == 'p2p':
-                ext = _ext(fmt, slot=slot)
+                ext = _ext(fmt, slot=slot, world=self.world)
                 handle = ext.init(*key)
                 handles = [None] * self.world
                 dist.all_gather_object(handles, handle, group=group)
@@ -243,9 +261,10 @@ class Sm120Fp4MegaMoeBuffer:
         if not hasattr(backend, '_comm_ptr'):
             raise RuntimeError(f"transport '{self.transport}' needs a ProcessGroupNCCL group")
         comm = int(backend._comm_ptr())
-        session = _gin_session()
+        session = _gin_session(world)
         gin_type = int(session.gin_type(comm, rank, world))
-        handle = session.create(comm, rank, world, int(_ext(self.fmt, slot=self.slot).window_bytes(*key)), _GIN_CONTEXTS)
+        handle = session.create(comm, rank, world, int(_ext(self.fmt, slot=self.slot, world=world).window_bytes(*key)),
+                                _GIN_CONTEXTS)
         base, win, dev_comm, contexts = (int(v) for v in session.info(handle))
         peers = [int(p) for p in session.peers(handle)]
         gin_ok = dev_comm != 0 and gin_type in _GIN_BUILDS
@@ -254,7 +273,7 @@ class Sm120Fp4MegaMoeBuffer:
         if spec == 'auto':
             feasible = T.build_candidates(world, pair_ok, gin_ok, {}, {})
             if gin_ok and len(feasible) > 1:  # the probe runs on the GIN build
-                probe_ext = _ext(self.fmt, gin_type, self.slot)
+                probe_ext = _ext(self.fmt, gin_type, self.slot, world)
                 probe_ext.window_bytes(*key)
                 token_row = self.hidden // (1 if self.fmt == 'w4a8' else 2) + self.hidden // FORMATS[self.fmt] + 16
                 table, report = T.select_transport_table(
@@ -285,7 +304,8 @@ class Sm120Fp4MegaMoeBuffer:
         T.validate_table(table, pair_ok, gin_ok)
         row = table.row(rank)
         mask = sum(1 << w for w in range(world) if w != rank and row[w] == T.TRANSPORT_GIN)
-        ext = _ext(self.fmt, gin_type if mask else 0, self.slot)  # without GIN peers the build without the GIN code (faster)
+        # without GIN peers the build without the GIN code (faster)
+        ext = _ext(self.fmt, gin_type if mask else 0, self.slot, world)
         ext.init_window(*key, base, [0 if mask >> w & 1 else peers[w] for w in range(world)], mask, dev_comm, win,
                         contexts)
         self.gin_mask, self.transport_table, self.transport_report = mask, table, report

@@ -727,7 +727,7 @@ index 0000000..bd55f46
 +    if buf is None:
 +        # the kernel's work-item table holds EL + W * TCAP * top-k / 8 tiles (kMaxTiles)
 +        world = group.size()
-+        cap = (2304 - num_experts // world) * 8 // (world * top_k)
++        cap = (sm120_fp4().max_tiles(world) - num_experts // world) * 8 // (world * top_k)
 +        if num_max_tokens_per_rank > cap:
 +            raise ValueError(
 +                f"SM120 MegaMoE supports at most {cap} tokens per rank here "

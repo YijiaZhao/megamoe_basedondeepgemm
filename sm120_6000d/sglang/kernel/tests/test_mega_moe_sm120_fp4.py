@@ -400,7 +400,7 @@ def main():
     dist.init_process_group('nccl', device_id=torch.device('cuda', local_rank))
     rank, world = dist.get_rank(), dist.get_world_size()
     if rank == 0:  # build once before the other ranks load it
-        fp4._ext(fmt)
+        fp4._ext(fmt, world=world)
     dist.barrier()
     if mode == 'stress':
         stress(fmt, rank, world, dist.group.WORLD, transport, next((a for a in args if a in SHAPES), 'dsv41_eplb16'),
