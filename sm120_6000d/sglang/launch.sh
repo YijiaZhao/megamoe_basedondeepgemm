@@ -47,7 +47,7 @@ mkdir -p "$BUILD_DIR"
 
 ENVS=(-e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1)
 DEV=()
-EPLB_MAP=${EPLB_MAP:-$([ "${EPLB:-0}" = 1 ] && echo "$HERE/eplb_map_r${WORLD}_ep${WORLD}.pt")}
+EPLB_MAP=${EPLB_MAP:-$([ "${EPLB:-0}" = 1 ] && echo "$HERE/eplb_map_r${WORLD}_ep${WORLD}.pt" || true)}
 EPLB_VOL=() EPLB_ARGS=""
 if [ -n "$EPLB_MAP" ] && [ ! -f "$EPLB_MAP" ]; then
   echo "EPLB placement file not found: $EPLB_MAP (set EPLB_MAP and REDUNDANT; this directory has EP8 and EP16 only)" >&2; exit 1
