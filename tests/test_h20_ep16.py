@@ -8,11 +8,13 @@ E384 / H3072 / I1280 / top-8, T tokens per rank, forced-balanced routing:
 verify: exact-quantised reference (FP8 / int8 activations, dequantised weights, quantised intermediate),
         cos / norm of y against it on every rank.
 bench : one CUDA graph per call (EP8: the fused kernel; EP16: dispatch exchange + node kernel + combine
-        exchange + add; EP16 also the node kernel alone), cold L2 (256 MiB zero) and an on-stream
+        exchange + add; EP16 also the node kernel alone; EP16 --transport gin: the one fused kernel, the
+        cross-node exchange inside it, inputs already in the buffer as for EP8), cold L2 (256 MiB zero) and an on-stream
         all-reduce before every replay, CUDA-event span of the replay; median over the replays per rank,
         reported for rank 0 and as the max over the ranks.
 
 torchrun --nnodes 2 --nproc-per-node 8 ... tests/test_h20_ep16.py --mode ep16
+torchrun --nnodes 2 --nproc-per-node 8 ... tests/test_h20_ep16.py --mode ep16 --transport gin
 torchrun --nproc-per-node 8 tests/test_h20_ep16.py --mode ep8
 """
 import argparse
@@ -24,6 +26,10 @@ import torch.distributed as dist
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+if "--transport" in sys.argv and sys.argv[sys.argv.index("--transport") + 1] == "gin":
+    import nvidia.nccl  # the fused kernel includes NCCL's device API (before the first JIT build)
+    os.environ["DG_JIT_EXTRA_FLAGS"] = "-I" + os.path.join(list(nvidia.nccl.__path__)[0], "include")
 
 import deep_gemm
 from deep_gemm.mega.ep16 import H20EP16
@@ -68,6 +74,58 @@ def balanced_routing(mode, rank, t, topk, local_experts, world):
     return idx.contiguous(), w
 
 
+# slot: (label, min-slot) -- see the slot list at the top of the fused kernel body
+STAMP_SLOTS = {1: ("routing done (barrier #1)", False), 2: ("pull done", False),
+               48: ("input put issued", False), 49: ("peer input rows seen", False), 50: ("peer rows copied in", False),
+               3: ("first math task", True), 6: ("max token arrivals (fine combine)", False),
+               53: ("first combined peer row put", True), 54: ("last combined peer row put", False),
+               51: ("first own-row wait for peer partial", True), 52: ("last peer partial seen", False),
+               7: ("combine end", False)}
+
+
+def stamp_phases(ep, weights, args, y, flush, align, rank, world, replays=20):
+    # One graph: reset the stamps, run the kernel. Per replay every slot minus the kernel entry (slot 0);
+    # median over the replays, printed for every rank (globaltimer is per GPU: only within-rank deltas).
+    stamps = torch.zeros(64, dtype=torch.int64, device="cuda")
+    init = torch.zeros(64, dtype=torch.int64, device="cuda")
+    for slot in [0] + [k for k, (_, is_min) in STAMP_SLOTS.items() if is_min]:
+        init[slot] = 2 ** 63 - 1
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            stamps.copy_(init)
+            ep.run(y, None, None, weights, activation_clamp=args.activation_clamp, phase_stamps=stamps)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    dist.barrier()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        stamps.copy_(init)
+        ep.run(y, None, None, weights, activation_clamp=args.activation_clamp, phase_stamps=stamps)
+    torch.cuda.synchronize()
+    dist.barrier()
+    rows = []
+    for _ in range(replays):
+        flush.zero_()
+        dist.all_reduce(align)
+        g.replay()
+        torch.cuda.synchronize()
+        rows.append(stamps.clone())
+    st = torch.stack(rows)
+    slots = list(STAMP_SLOTS)
+    rel = (st[:, slots] - st[:, :1]).double() / 1000.0
+    med = rel.median(dim=0).values.float()
+    allm = torch.empty(world, len(slots), device="cuda")
+    dist.all_gather_into_tensor(allm, med.contiguous())
+    if rank == 0:
+        print("STAMPS us after kernel entry, median of", replays, "replays; columns = ranks", flush=True)
+        for j, slot in enumerate(slots):
+            vals = " ".join(f"{v:7.1f}" for v in allm[:, j].tolist())
+            print(f"STAMP {slot:2d} {STAMP_SLOTS[slot][0]:<38s} {vals}", flush=True)
+    del g
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["ep8", "ep16"], required=True)
@@ -83,6 +141,12 @@ def main():
     p.add_argument("--iters", type=int, default=30)
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--skip-bench", action="store_true")
+    p.add_argument("--overlap", action="store_true", help="EP16: own-row kernel runs during the dispatch exchange")
+    p.add_argument("--stages", action="store_true", help="EP16: also time every stage in its own graph")
+    p.add_argument("--transport", choices=["nccl", "gin"], default="nccl",
+                   help="EP16 cross-node exchange: NCCL send/recv around the kernel, or NCCL GIN inside it")
+    p.add_argument("--stamps", action="store_true",
+                   help="EP16 gin: in-kernel phase timestamps (globaltimer, relative to kernel entry) per replay")
     args = p.parse_args()
 
     dist.init_process_group("nccl")
@@ -121,17 +185,41 @@ def main():
 
     topk_idx, topk_w = balanced_routing(args.mode, rank, t, topk, local_experts, world)
     if args.mode == "ep16":
-        ep = H20EP16(world_group, node_group, args.experts, t, topk, H, I, quant=args.quant)
+        ep = H20EP16(world_group, node_group, args.experts, t, topk, H, I, quant=args.quant, overlap=args.overlap,
+                     transport=args.transport)
+        gin = args.transport == "gin"
 
         def forward(y, xq, xs):
             ep(y, xq, xs, topk_idx, topk_w, weights, activation_clamp=args.activation_clamp)
 
         def ep16_run(y, xq, xs):
-            # x / x_sf already in buffer rows [0, T) (as for the EP8 kernel-only graph)
-            ep.run(y, topk_idx, topk_w, weights, activation_clamp=args.activation_clamp)
+            # x / x_sf (gin: and the top-k) already in buffer rows [0, T) (as for the EP8 kernel-only graph)
+            ep.run(y, None if gin else topk_idx, None if gin else topk_w, weights, activation_clamp=args.activation_clamp)
 
-        def node_kernel_only(y, xq, xs):
-            kernel(ep.y_node, *weights, ep.buffer, activation_clamp=args.activation_clamp)
+        def wait(works):
+            for w in works:
+                w.wait()
+
+        stages = [
+            ("stage pack (route split + pack)", lambda y, xq, xs: ep.pack(topk_idx, topk_w)),
+            ("stage dispatch exchange (NCCL)", lambda y, xq, xs: wait(ep.dispatch())),
+            ("stage unpack", lambda y, xq, xs: ep.unpack()),
+            ("stage combine exchange (NCCL)", lambda y, xq, xs: wait(ep.combine())),
+            ("stage add", lambda y, xq, xs: torch.add(ep.y_own, ep.y_back, out=y)),
+        ]
+        if gin:
+            stages, node_kernel_only = [], None
+        elif args.overlap:
+            stages[3:3] = [
+                ("stage node kernel, own rows (T)", lambda y, xq, xs: ep.node_kernel(
+                    ep.y_own, weights, ep.buffer, args.activation_clamp)),
+                ("stage node kernel, peer rows (T)", lambda y, xq, xs: ep.node_kernel(
+                    ep.y_peer, weights, ep.peer_buffer, args.activation_clamp)),
+            ]
+            node_kernel_only = None
+        else:
+            def node_kernel_only(y, xq, xs):
+                kernel(ep.y_node, *weights, ep.buffer, activation_clamp=args.activation_clamp)
     else:
         buffer = deep_gemm.get_fused_symm_buffer_for_mega_moe(node_group, args.experts, t, topk, H, I)
 
@@ -235,8 +323,18 @@ def main():
 
         forward(y, xq, xs)          # fills the buffer inputs (EP8: the kernel-only graph reads them)
         if args.mode == "ep16":
-            bench(ep16_run, "full (route split + dispatch exchange + node kernel + combine exchange + add)")
-        bench(node_kernel_only, "kernel only")
+            if gin:
+                bench(ep16_run, "full gin (one fused kernel, cross-node exchange inside)")
+            else:
+                tag = "overlap" if args.overlap else "serial"
+                bench(ep16_run, f"full {tag} (pack + dispatch exchange + unpack + node kernel + combine exchange + add)")
+            if args.stages:
+                for label, fn in stages:
+                    bench(fn, label)
+        if node_kernel_only is not None:
+            bench(node_kernel_only, "kernel only")
+        if args.mode == "ep16" and gin and args.stamps:
+            stamp_phases(ep, weights, args, y, flush, align, rank, world)
 
     dist.barrier()
     dist.destroy_process_group()

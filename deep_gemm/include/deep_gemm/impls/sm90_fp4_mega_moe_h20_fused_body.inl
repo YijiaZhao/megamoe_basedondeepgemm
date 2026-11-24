@@ -32,6 +32,9 @@
     //   0 min kernel entry | 1 max dispatch routing done | 2 max dispatch pull done
     //   3 min first math task | 4 max last L1 task end | 5 max last L2 task end
     //   6 max after combine NVLink barrier | 7 max combine end | 16 max DG_FE_SELECT_IN_MEGA select done
+    //   EP16 GIN: 48 max input put issued | 49 max peer input rows seen | 50 max peer rows copied in
+    //   51 min first own-row wait for the peer's partial | 52 max last peer partial seen
+    //   53 min first combined peer row put | 54 max last combined peer row put
     const auto stamp_min = [&](const uint32_t slot) {
         if (phase_stamps != nullptr) {
             unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -783,12 +786,51 @@
     // topk_idx / topk_weights loads: read-only (__ldg, ld.global.nc) when the frontend produced
     // them; under DG_FE_SELECT_IN_MEGA the prologue warps of THIS kernel wrote them, so the
     // non-coherent path may return stale data -> ld.global.cg (L2-coherent) instead.
+    // EP16 GIN: the peer's rows [T, 2T) are written by this kernel too (copied in from the NIC
+    // receive region), and every top-k entry is a global expert, mapped to this node's 192 on read
+    // (-1 when it lives on the other node, whose launch computes it).
+    constexpr bool kEp16Gin = DG_H20_EP16_GIN;
     const auto ld_topk_idx = [&](const int64_t* p) -> int64_t {
+        if constexpr (kEp16Gin) {
+            const int64_t e = static_cast<int64_t>(__ldcg(reinterpret_cast<const long long*>(p)));
+            const int64_t first = static_cast<int64_t>(ep16_gin.node) * kNumExperts;
+            return (e >= first and e < first + kNumExperts) ? e - first : -1;
+        }
         return fe_keys != nullptr ? static_cast<int64_t>(__ldcg(reinterpret_cast<const long long*>(p))) : __ldg(p);
     };
     const auto ld_topk_weight = [&](const float* p) -> float {
-        return fe_keys != nullptr ? __ldcg(p) : __ldg(p);
+        return (kEp16Gin or fe_keys != nullptr) ? __ldcg(p) : __ldg(p);
     };
+    // EP16 GIN window regions (see H20Ep16Gin) and this launch's signal target: the epoch word
+    // counts this rank's launches (SM0's cleanup adds 1 after every CTA has read it here), each
+    // launch of the peer adds 1 to every signal.
+    constexpr uint32_t kEp16RowBytes = kHidden + kHidden / 128 * 4 + kNumTopk * 12;
+    constexpr uint32_t kEp16YBytes = kHidden * sizeof(nv_bfloat16);
+    const uint64_t ep16_in_send = 0;
+    const uint64_t ep16_in_recv = static_cast<uint64_t>(ep16_gin.max_own) * kEp16RowBytes;
+    const uint64_t ep16_y_send = 2ull * ep16_gin.max_own * kEp16RowBytes;
+    const uint64_t ep16_y_recv = ep16_y_send + static_cast<uint64_t>(ep16_gin.max_own) * kEp16YBytes;
+    const uint64_t ep16_epoch_off = ep16_y_recv + static_cast<uint64_t>(ep16_gin.max_own) * kEp16YBytes;  // + 4: send counter
+    const uint64_t ep16_target = kEp16Gin ?
+        static_cast<uint64_t>(ptx::ld_volatile(reinterpret_cast<uint32_t*>(ep16_gin.base + ep16_epoch_off))) + 1ull : 0ull;
+#if DG_H20_EP16_GIN_DEVICE
+    const auto ep16_put = [&](const uint64_t dst_off, const uint64_t src_off, const uint64_t bytes, const uint32_t sig) {
+        const ncclDevComm& c = *static_cast<const ncclDevComm*>(ep16_gin.comm);
+        const ncclWindow_t win = static_cast<ncclWindow_t>(ep16_gin.win);
+        // Signal s on GIN context s % contexts (its own QP), the waiter reads it on the same one
+        ncclGin(c, static_cast<int>(sig % ep16_gin.num_contexts))
+            .put(ncclTeamWorld(c), static_cast<int>(1u - ep16_gin.node), win, dst_off, win, src_off, bytes,
+                          ncclGin_SignalInc{static_cast<ncclGinSignal_t>(sig)});
+    };
+    const auto ep16_wait = [&](const uint32_t sig, const uint32_t tag) {
+        const ncclDevComm& c = *static_cast<const ncclDevComm*>(ep16_gin.comm);
+        DG_SPIN_WHILE(ncclGin(c, static_cast<int>(sig % ep16_gin.num_contexts)).readSignal(static_cast<ncclGinSignal_t>(sig)) < ep16_target, tag);
+    };
+#else
+    const auto ep16_put = [&](const uint64_t, const uint64_t, const uint64_t, const uint32_t) {};
+    const auto ep16_wait = [&](const uint32_t, const uint32_t) {};
+#endif
+    const uint32_t ep16_num_own = kEp16Gin ? ep16_gin.num_own : num_tokens;
     // Fast NVLink-barrier epilogue: every thread snapshots the done count BEFORE
     // the kernel-start __syncthreads (see fused_comm::nvlink_barrier for why this
     // is race-free: SM0's first write of the word this launch is ordered after the
@@ -976,6 +1018,11 @@
                 if (thread_idx == 0)
                     *workspace.get_push_epoch_ptr() = ptx::ld_volatile(workspace.get_push_epoch_ptr()) + 1u;
             }
+            if constexpr (kEp16Gin) {
+                // Next launch's GIN signal target (every CTA read this launch's before the grid sync)
+                if (thread_idx == 0)
+                    *reinterpret_cast<uint32_t*>(ep16_gin.base + ep16_epoch_off) = static_cast<uint32_t>(ep16_target);
+            }
             if constexpr (kCombineDynamic) {
                 // Next dynamic-combine launch's ticket word (see `kCombineDynamic`)
                 if (thread_idx == 0) {
@@ -1058,6 +1105,113 @@
                 }
             }
         };
+
+        if constexpr (kEp16Gin) {
+            // The pull path only: push dispatch (<= 16 global tokens) reads the rows before routing.
+            DG_STATIC_ASSERT(!kPushDispatch, "EP16 GIN needs the pull dispatch");
+            DG_STATIC_ASSERT(kNumDispatchThreads % 32 == 0, "Invalid dispatch threads for the EP16 row items");
+            constexpr uint32_t kSFBytes = kHidden / 128 * 4;
+            constexpr uint32_t kRowUint4 = kHidden / 16;
+            constexpr uint32_t kRowSF = kSFBytes / 4;
+            constexpr uint32_t kGridThreads = kNumSMs * kNumDispatchThreads;
+            const uint32_t gtid = sm_idx * kNumDispatchThreads + thread_idx;
+            const uint32_t num_x_items = ep16_num_own * kRowUint4;
+            const uint32_t num_sf_items = ep16_num_own * kRowSF;
+            const uint32_t num_topk_items = ep16_num_own * kNumTopk;
+            // Send: the own rows [0, T) packed into in_send as grid-flattened items (x 16-byte chunks,
+            // SF, top-k, weights), at most a few per dispatch thread of the first CTAs, so the pack is one
+            // round of loads instead of a serial walk over the rows on one CTA. Every packing warp
+            // releases and counts in; the last one puts the T rows into the peer's in_recv (signal 0)
+            // and resets the counter (the next launch's warps start after this kernel).
+            {
+                const uint32_t num_items = num_x_items + num_sf_items + 2 * num_topk_items;
+                const uint32_t num_send_warps = math::ceil_div(num_items < kGridThreads ? num_items : kGridThreads, 32u);
+                if (gtid / 32 < num_send_warps) {
+                    for (uint32_t i = gtid; i < num_items; i += kGridThreads) {
+                        if (i < num_x_items) {
+                            const uint32_t t = i / kRowUint4, c = i % kRowUint4;
+                            reinterpret_cast<uint4*>(ep16_gin.base + ep16_in_send + static_cast<uint64_t>(t) * kEp16RowBytes)[c] =
+                                __ldcg(input_token_buffer.get_data_buffer(t).get_base_ptr<uint4>() + c);
+                        } else if (i < num_x_items + num_sf_items) {
+                            const uint32_t j = i - num_x_items, t = j / kRowSF, s = j % kRowSF;
+                            reinterpret_cast<float*>(ep16_gin.base + ep16_in_send + static_cast<uint64_t>(t) * kEp16RowBytes + kHidden)[s] =
+                                __ldcg(input_sf_buffer.get_data_buffer(t).get_base_ptr<float>() + s);
+                        } else if (i < num_x_items + num_sf_items + num_topk_items) {
+                            const uint32_t j = i - num_x_items - num_sf_items, t = j / kNumTopk;
+                            reinterpret_cast<long long*>(ep16_gin.base + ep16_in_send + static_cast<uint64_t>(t) * kEp16RowBytes + kHidden + kSFBytes)[j % kNumTopk] =
+                                __ldcg(reinterpret_cast<const long long*>(input_topk_idx_buffer.get_base_ptr<int64_t>()) + j);
+                        } else {
+                            const uint32_t j = i - num_x_items - num_sf_items - num_topk_items, t = j / kNumTopk;
+                            reinterpret_cast<float*>(ep16_gin.base + ep16_in_send + static_cast<uint64_t>(t) * kEp16RowBytes + kHidden + kSFBytes + kNumTopk * 8)[j % kNumTopk] =
+                                __ldcg(input_topk_weights_buffer.get_base_ptr<float>() + j);
+                        }
+                    }
+                    __syncwarp();
+                    if (lane_idx == 0) {
+                        __threadfence_system();
+                        auto* counter = reinterpret_cast<uint32_t*>(ep16_gin.base + ep16_epoch_off + 4);
+                        if (atomicAdd(counter, 1u) + 1u == num_send_warps) {
+                            *counter = 0u;
+                            __threadfence_system();
+                            ep16_put(ep16_in_recv, ep16_in_send, static_cast<uint64_t>(ep16_num_own) * kEp16RowBytes, 0);
+                            stamp_max(48);
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+            // Receive x / SF: the peer rows from in_recv into the token buffer rows [T, 2T), the same
+            // grid-flattened items; the NVLink ranks pull them after barrier #1.
+            {
+                const uint32_t num_items = num_x_items + num_sf_items;
+                if (gtid - lane_idx < num_items) {
+                    if (lane_idx == 0) {
+                        ep16_wait(0, 5001);
+                        stamp_max(49);
+                    }
+                    __syncwarp();
+                    for (uint32_t i = gtid; i < num_items; i += kGridThreads) {
+                        if (i < num_x_items) {
+                            const uint32_t t = i / kRowUint4, c = i % kRowUint4;
+                            input_token_buffer.get_data_buffer(ep16_num_own + t).get_base_ptr<uint4>()[c] =
+                                __ldcv(reinterpret_cast<const uint4*>(ep16_gin.base + ep16_in_recv + static_cast<uint64_t>(t) * kEp16RowBytes) + c);
+                        } else {
+                            const uint32_t j = i - num_x_items, t = j / kRowSF, s = j % kRowSF;
+                            input_sf_buffer.get_data_buffer(ep16_num_own + t).get_base_ptr<float>()[s] =
+                                __ldcv(reinterpret_cast<const float*>(ep16_gin.base + ep16_in_recv + static_cast<uint64_t>(t) * kEp16RowBytes + kHidden) + s);
+                        }
+                    }
+                    __syncwarp();
+                    if (lane_idx == 0)
+                        stamp_max(50);
+                }
+            }
+            // Receive top-k / weights of the peer rows this warp routes (`read_topk_idx`'s row and lane
+            // mapping, so each lane reads back its own store): one load per lane.
+            if (warp_idx < kNumActiveDispatchWarps) {
+                for (uint32_t i = (sm_idx * kNumActiveDispatchWarps + warp_idx) * kNumTokensPerWarp;
+                     i < num_tokens;
+                     i += kNumSMs * kNumActiveDispatchWarps * kNumTokensPerWarp) {
+                    const uint32_t t = i + lane_idx / kNumTopk;
+                    const bool peer = lane_idx < kNumActivateLanes and t >= ep16_num_own and t < num_tokens;
+                    if (__any_sync(0xffffffff, peer)) {
+                        if (lane_idx == 0)
+                            ep16_wait(0, 5003);
+                        __syncwarp();
+                        if (peer) {
+                            const uint8_t* src = ep16_gin.base + ep16_in_recv + static_cast<uint64_t>(t - ep16_num_own) * kEp16RowBytes +
+                                                 kHidden + kSFBytes;
+                            const uint32_t k = lane_idx % kNumTopk;
+                            input_topk_idx_buffer.get_base_ptr<int64_t>()[t * kNumTopk + k] =
+                                __ldcv(reinterpret_cast<const long long*>(src) + k);
+                            input_topk_weights_buffer.get_base_ptr<float>()[t * kNumTopk + k] =
+                                __ldcv(reinterpret_cast<const float*>(src + kNumTopk * 8) + k);
+                        }
+                    }
+                    __syncwarp();
+                }
+            }
+        }
 
         // Lean routing (kLeanRouting; host env DG_FP4_LEAN_ROUTING, default 1).
         // Baseline: every CTA adds `(1 << 32) | count` to ALL 384 `expert_send_count`
@@ -4463,6 +4617,17 @@
                 }
                 __syncwarp();
             }
+            // EP16 GIN: an own row adds the peer node's partial of the same token (its
+            // experts there), which arrives as the peer's combined row `token_idx`.
+            const bool ep16_peer_row = kEp16Gin and token_idx >= ep16_num_own;
+            if (kEp16Gin and not ep16_peer_row) {
+                if (lane_idx == 0) {
+                    stamp_min(51);
+                    ep16_wait(1 + token_idx, 5002);
+                    stamp_max(52);
+                }
+                __syncwarp();
+            }
 
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
@@ -4504,6 +4669,35 @@
                     load_stage_idx ^= 1;
                 }
 
+                if constexpr (kEp16Gin) {
+                    const uint64_t row_off = static_cast<uint64_t>(ep16_peer_row ? token_idx - ep16_num_own : token_idx) * kEp16YBytes +
+                                             chunk_byte_offset;
+                    if (ep16_peer_row) {
+                        // The peer's row: to y_send, put back after the last chunk
+                        auto* dst = reinterpret_cast<uint4*>(ep16_gin.base + ep16_y_send + row_off);
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                            uint4 casted;
+                            auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
+                            #pragma unroll
+                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                                casted_bf16[l] = __float22bfloat162_rn(reduced[j * kNumElemsPerUint4 + l]);
+                            dst[j * 32 + lane_idx] = casted;
+                        }
+                        continue;
+                    }
+                    // Own row: + the peer's partial
+                    const auto* src = reinterpret_cast<const uint4*>(ep16_gin.base + ep16_y_recv + row_off);
+                    #pragma unroll
+                    for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                        const auto uint4_values = __ldcv(src + j * 32 + lane_idx);
+                        const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                        #pragma unroll
+                        for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+                            ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
+                    }
+                }
+
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
                     uint4 casted;
@@ -4527,6 +4721,17 @@
                         math::advance_ptr(y, static_cast<uint64_t>(token_idx) * kNumHiddenBytes + chunk_byte_offset),
                         combine_store_buffer, kNumChunkBytes);
                     cute::tma_store_arrive();
+                }
+                __syncwarp();
+            }
+            if (ep16_peer_row) {
+                __syncwarp();
+                if (lane_idx == 0) {
+                    __threadfence_system();
+                    const uint64_t row_off = static_cast<uint64_t>(token_idx - ep16_num_own) * kEp16YBytes;
+                    stamp_min(53);
+                    ep16_put(ep16_y_recv + row_off, ep16_y_send + row_off, kEp16YBytes, 1 + token_idx - ep16_num_own);
+                    stamp_max(54);
                 }
                 __syncwarp();
             }

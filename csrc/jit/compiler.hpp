@@ -59,6 +59,9 @@ public:
             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
+        // Extra flags for every kernel, e.g. an include directory (deep_gemm/mega/ep16.py: NCCL's)
+        if (const auto extra = get_env<std::string>("DG_JIT_EXTRA_FLAGS"); not extra.empty())
+            flags += " " + extra;
     }
 
     virtual ~Compiler() = default;

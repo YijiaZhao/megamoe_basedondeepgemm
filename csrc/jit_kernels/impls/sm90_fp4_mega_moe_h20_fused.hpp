@@ -11,6 +11,7 @@
 
 #include <deep_gemm/layout/mega_moe_fused.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#include <deep_gemm/layout/h20_ep16_gin.cuh>
 
 #include "../heuristics/sm90_fp4_mega_moe_h20_fused.hpp"
 
@@ -53,6 +54,9 @@ public:
         int l1_task_tiles;
         int l2_task_tiles;
         int num_experts;
+        int num_sms;
+        // Two-node EP16 over NCCL GIN (0: off, else the NCCL GIN type of the rail communicator)
+        int ep16_gin_type;
         SM90FP4H20FusedConfig config;
 
         void* y;
@@ -72,6 +76,7 @@ public:
         const float* l2_global_scales;
         unsigned long long* phase_stamps;
         const uint32_t* fe_keys;
+        H20Ep16Gin ep16_gin;
         LaunchArgs launch_args;
     };
 
@@ -82,11 +87,20 @@ public:
         const std::string kernel_header = fmt::format(
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
             "#define DG_H20_NUM_EXPERTS {}\n"
+            "#define DG_H20_NUM_SMS {}\n"
+            "{}"
             "{}"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
             args.num_experts,
+            args.num_sms,
             get_env<int>("DG_FP4_SPIN_TIMEOUT", 0) != 0 ? "#define DG_FUSED_SPIN_TIMEOUT 1\n" : "",
+            // NCCL GIN: keep only the rail communicator's backend (NCCL_GIN_TYPE_PROXY 2, GDAKI 3);
+            // the NCCL include directory comes from DG_JIT_EXTRA_FLAGS (deep_gemm/mega/ep16.py)
+            args.ep16_gin_type == 0 ? std::string() : fmt::format(
+                "#define DG_H20_EP16_GIN 1\n#define _CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE\n"
+                "#define NCCL_GIN_GPI_ENABLE 0\n#define NCCL_GIN_PROXY_ENABLE {}\n#define NCCL_GIN_GDAKI_ENABLE {}\n",
+                int(args.ep16_gin_type == 2), int(args.ep16_gin_type == 3)),
             kernel_symbol);
         const std::string policy_template_args = fmt::format(
             "/* kSwapABRequested */ {},\n"
@@ -201,7 +215,8 @@ static void __instantiate_kernel() {{
             args.l1_global_scales,
             args.l2_global_scales,
             args.phase_stamps,
-            args.fe_keys));
+            args.fe_keys,
+            args.ep16_gin));
     }
 };
 
@@ -224,7 +239,10 @@ static void sm90_fp4_h20_fused_mega_moe(
     const std::optional<torch::Tensor>& phase_stamps = std::nullopt,
     const bool& qoq = false,
     // DG_FE_SELECT_IN_MEGA=1: the Fable cc frontend's compact [token][384] u32 key array
-    const std::optional<torch::Tensor>& fe_keys = std::nullopt
+    const std::optional<torch::Tensor>& fe_keys = std::nullopt,
+    // Two-node EP16 over NCCL GIN: {ncclDevComm*, ncclWindow_t, window base, node, max own rows,
+    // GIN type[, GIN contexts]} (deep_gemm/mega/ep16.py), empty = off. num_tokens is then 2T (own + peer rows).
+    const std::vector<int64_t>& ep16_gin = {}
 ) {
     const int num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const int num_experts = num_experts_per_rank * num_ranks;
@@ -662,6 +680,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l1_task_tiles = l1_task_tiles,
         .l2_task_tiles = l2_task_tiles,
         .num_experts = num_experts,
+        .num_sms = num_sms,
+        .ep16_gin_type = ep16_gin.empty() ? 0 : static_cast<int>(ep16_gin[5]),
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_stats_ptr,
@@ -682,6 +702,11 @@ static void sm90_fp4_h20_fused_mega_moe(
             reinterpret_cast<unsigned long long*>(phase_stamps->data_ptr()) : nullptr,
         // DG_FE_SELECT_IN_MEGA=1: Fable cc frontend compact key array ([token][384] u32)
         .fe_keys = fe_keys.has_value() ? reinterpret_cast<const uint32_t*>(fe_keys->data_ptr()) : nullptr,
+        .ep16_gin = ep16_gin.empty() ? H20Ep16Gin{} : H20Ep16Gin{
+            reinterpret_cast<const void*>(ep16_gin[0]), reinterpret_cast<void*>(ep16_gin[1]),
+            reinterpret_cast<uint8_t*>(ep16_gin[2]), static_cast<uint32_t>(ep16_gin[3]),
+            static_cast<uint32_t>(num_tokens / 2), static_cast<uint32_t>(ep16_gin[4]),
+            static_cast<uint32_t>(ep16_gin.size() > 6 ? ep16_gin[6] : 1)},
         .launch_args = LaunchArgs(num_sms, KernelConfig::kNumThreads, config.smem_size)
     };
 
@@ -704,7 +729,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         ((qoq && get_env<int>("DG_FP4_QIS2_ILV", 0) != 0) ? "_ilv" : "") +
         ((qoq && get_env<int>("DG_FP4_QIS2_PREFETCH_PACKED", 1) == 0) ? "_nopf" : "") +
         (get_env<int>("DG_FP4_RF_PREFETCH_PACKED", 0) != 0 ? "_rfpf" : "") +
-        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "");
+        (wide_tiles ? fmt::format("_bn{}x{}", 256 * l1_task_tiles, 256 * l2_task_tiles) : "") +
+        (ep16_gin.empty() ? "" : fmt::format("_ep16gin{}", ep16_gin[5]));
     const auto runtime = compiler->build(kernel_name, code);
     SM90FP4H20FusedRuntime::launch(runtime, args);
 }

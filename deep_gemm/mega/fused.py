@@ -94,12 +94,12 @@ def _fe_keys_for(b):
     cache = getattr(b, "_fable_frontend_cache", None)
     return cache.get("keys_active") if cache else None
 
-def mxfp4_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None,fe_keys=None):
+def mxfp4_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None,fe_keys=None,ep16_gin=None):
     w1,sf1,rs1=l1; w2,sf2,rs2=l2
     if fe_keys is None: fe_keys=_fe_keys_for(b)
-    _C.mxfp4_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps,fe_keys)
+    _C.mxfp4_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps,fe_keys,ep16_gin or [])
 
-def qoq_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None,fe_keys=None):
+def qoq_mega_moe_fused(y,l1,l2,b,cumulative_local_expert_recv_stats=None,activation_clamp=10.0,fast_math=True,phase_stamps=None,fe_keys=None,ep16_gin=None):
     w1,sf1,rs1=l1; w2,sf2,rs2=l2
     if fe_keys is None: fe_keys=_fe_keys_for(b)
-    _C.qoq_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps,fe_keys)
+    _C.qoq_mega_moe_fused(y,(w1,sf1),(w2,sf2),cumulative_local_expert_recv_stats,rs1,rs2,b.buffer,b.handle.buffer_ptrs,b.group.rank(),b.num_max_tokens_per_rank,b.num_experts,b.num_topk,activation_clamp,fast_math,phase_stamps,fe_keys,ep16_gin or [])

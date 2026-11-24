@@ -49,7 +49,9 @@ struct SM90FP4H20FusedShape {
     }
 
     constexpr bool is_supported_h200_shape() const noexcept {
-        return num_sms == kH200NumSMs &&
+        // Fewer SMs than the device has: EP16 overlap keeps SMs free for the
+        // concurrent NCCL kernel (see deep_gemm/mega/ep16.py).
+        return num_sms <= kH200NumSMs && num_sms >= kH200NumSMs - 8 &&
             num_ranks == kNumRanks &&
             (num_experts == kExpertsPerRank * kNumRanks ||
              num_experts == kEP16ExpertsPerRank * kNumRanks) &&
@@ -124,8 +126,9 @@ select_sm90_nvfp4_h200_fused(
         tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};
     else if (input.num_tokens <= 8)
-        tuning = {8, 256, 16, bm8_stages, SM90ArchSpec::smem_capacity,
-                  true, true, true};
+        // EP16 (24 experts per rank): one wave of all 24
+        tuning = {8, 256, input.num_experts_per_rank % 16 == 0 ? 16 : 24, bm8_stages,
+                  SM90ArchSpec::smem_capacity, true, true, true};
     else if (input.num_tokens <= 16)
         tuning = {8, 256, 24, bm8_stages, SM90ArchSpec::smem_capacity,
                   true, true, true};

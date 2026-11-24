@@ -21,6 +21,7 @@
 #include <deep_gemm/comm/barrier_fused.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe_fused.cuh>
+#include <deep_gemm/layout/h20_ep16_gin.cuh>
 #include <deep_gemm/mma/sm90.cuh>
 #include <deep_gemm/scheduler/mega_moe_fused.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -29,7 +30,23 @@
 #include <deep_gemm/ptx/wgmma.cuh>
 #include <deep_gemm/quantization/fp4_fused_dequant.cuh>
 
+// Two-node EP16 inside the kernel (deep_gemm/mega/ep16.py, transport 'gin'): the launch is one
+// node of 8 NVLink ranks and 192 experts; rows [0, T) are this rank's tokens, rows [T, 2T) the
+// rail peer's (same local GPU on the other node), which arrive through the NIC with one NCCL GIN
+// put; the peer's combined rows go back the same way, one put per row. NCCL's device headers only
+// compile in the device pass.
+#ifndef DG_H20_EP16_GIN
+#define DG_H20_EP16_GIN 0
+#endif
+#if DG_H20_EP16_GIN && defined(__CUDA_ARCH__)
+#include <nccl_device.h>
+#define DG_H20_EP16_GIN_DEVICE 1
+#else
+#define DG_H20_EP16_GIN_DEVICE 0
+#endif
+
 namespace deep_gemm {
+
 namespace nvfp4 {
 
 __device__ __forceinline__ uint2 dequant_mode2_nibble_word(
@@ -547,7 +564,8 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         const float* __restrict__ l2_global_scales,
         unsigned long long* __restrict__ phase_stamps,
         // DG_FE_SELECT_IN_MEGA=1: the Fable cc frontend's compact [token][384] u32 key array (nullptr = topk from the frontend)
-        const uint32_t* __restrict__ fe_keys) {
+        const uint32_t* __restrict__ fe_keys,
+        const __grid_constant__ H20Ep16Gin ep16_gin) {
     constexpr uint32_t kHidden = 3072;
     constexpr uint32_t kIntermediateHidden = 1280;
     // Experts across the kNumRanks NVLink ranks of this launch: 384 (EP8), or 192 when
@@ -561,7 +579,12 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
     constexpr uint32_t kNumDispatchThreads = 64;
     constexpr uint32_t kNumNonEpilogueThreads = 64;
     constexpr uint32_t kNumEpilogueThreads = 256;
-    constexpr uint32_t kNumSMs = 78;
+    // Grid size: the device's 78 SMs, or fewer when SMs are kept free for a
+    // concurrent kernel (EP16 overlap, see deep_gemm/mega/ep16.py).
+#ifndef DG_H20_NUM_SMS
+#define DG_H20_NUM_SMS 78
+#endif
+    constexpr uint32_t kNumSMs = DG_H20_NUM_SMS;
     constexpr uint32_t kNumRanks = 8;
     constexpr uint32_t L1_SHAPE_N = kIntermediateHidden * 2;
     constexpr uint32_t L1_SHAPE_K = kHidden;
