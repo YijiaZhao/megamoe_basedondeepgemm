@@ -20,6 +20,8 @@ Window transports (every `transport` but `'p2p'`): NCCL reads its own variables.
 other (on .20 they sit on different subnets, and the NCCL window registration fails), pin every rank to one NIC with
 `NCCL_IB_HCA==mlx5_0`. `NCCL_IB_HCA` also decides which pairs NCCL maps for P2P, i.e. what `'lsa_where_reachable'` /
 `'auto'` can use: on the CX8 hosts (.1/.3/.6) all 8 NICs map only the GPUs of one CPU socket, one NIC maps every pair.
+On RoCE, set `NCCL_IB_TC` to the fabric's lossless traffic class (on the CX8 hosts `96`, see the table below): the NIC
+transport's queue pairs use it, not the port's global traffic class.
 
 ## Two-host EP16 on the CX8 hosts (.3 + .1): the network setup the W4A4.md EP16 numbers were measured with
 
@@ -37,6 +39,7 @@ Launcher: [`bench/run_ep16.sh`](bench/run_ep16.sh), started on both hosts at onc
 | Data NICs | 4 x ConnectX-8, both ports of each up: 8 x 400 Gb/s RoCE. Each port is its own /31 link to the fabric (172.16.{0,32,64,96,128,160,192,224}.x; .1 ends in .1, .3 in .5), with a 172.16.0.0/13 route through every port: every port of one host reaches every port of the other (ping-checked port by port) |
 | `NCCL_IB_HCA` | unset (all NICs). NCCL lists the 8 ports plus `mlx5_bond_0`, merges the two ports of each card into one device (`NET/IB/9`-`12` in the log) and gives each GPU the card behind its own PCIe switch, with GPUDirect RDMA (`GDRDMA`, DMA-BUF) |
 | NIC transport | `GIN_IB_GDAKI` (GIN type 3: the GPU posts the RDMA itself), 4 contexts per rank; the extension is built as `sm120_fp4_mega_moe_<fmt>_gin_gdaki` |
+| `NCCL_IB_TC` | `96` (`run_ep16.sh` default). The ports trust DSCP and run PFC on priority 3 only (`mlnx_qos`: DSCP 24-31 → priority 3, PFC enabled 0 0 0 1 0 0 0 0); `/sys/class/infiniband/mlx5_*/tc/1/traffic_class` says `Global tclass=96`, but the GDAKI queue pairs do not get it: unset, their RDMA goes out on priority 0, which is lossy with a ~20 KB receive buffer. With 12 NIC peers per rank the FC2 partials of a 32 / 64-token tile overflow it (`ethtool -S`: `rx_prio0_buf_discard`), and the ranks that wait on the dropped data fall behind by 1-100 ms (GLM-5.3-Flash MXFP4 EP16, 640 tokens per rank: slowest rank 2486 µs unset, 1406 µs with `96`; 17030 vs 0 priority-0 drops during the run) |
 | P2P pairs | with all NICs NCCL maps only the 4 GPUs of a rank's own socket; `'lsa_where_reachable'` sends those over P2P and the other 12 ranks over the NIC |
 
 | Card | Ports (netdev) | PCIe | Behind the switch of | Socket |
