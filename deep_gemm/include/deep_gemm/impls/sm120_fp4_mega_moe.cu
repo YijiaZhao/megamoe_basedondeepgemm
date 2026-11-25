@@ -324,6 +324,10 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
         for (int u = 0; u < kUnroll; ++u) {
             const int kc = k0 + u;
             if constexpr (kA8) {
+                uint4 xv[NT];  // this lane's 4 words of the K64 chunk (aperm order), one 16 B load
+#pragma unroll
+                for (int s = 0; s < NT; ++s)
+                    xv[s] = *reinterpret_cast<const uint4 *>(xrow[s] + (kc >> 2) * 64 + c * 16 + (kc & 3) * 4);
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {  // the two K32 steps of the fragment
                     const int step = kc * 2 + h;
@@ -331,8 +335,8 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
                     uint32_t b0[NT], b1[NT], sfb[NT];
 #pragma unroll
                     for (int s = 0; s < NT; ++s) {
-                        b0[s] = xrow[s][step * 8 + c];
-                        b1[s] = xrow[s][step * 8 + 4 + c];
+                        b0[s] = h ? xv[s].z : xv[s].x;
+                        b1[s] = h ? xv[s].w : xv[s].y;
                         sfb[s] = xsrow[s][kc / 2];
                     }
 #pragma unroll
@@ -441,11 +445,15 @@ __device__ __forceinline__ void store_q(uint8_t *dst, const uint32_t (&q)[kQW]) 
     }
 }
 
-// W4A4 activation rows (the staged token rows and the FC1 output): within each K256 block (32 words) word kc * 8 +
-// h * 4 + c of the MMA order (K64 chunk kc, half h, quad lane c) is stored at c * 8 + kc * 2 + h, so the GEMM reads a
-// lane's 8 words of a step in two 16 B loads instead of 8 scalar ones. W4A8 keeps the plain order
+// Activation rows (the staged token rows and the FC1 output) in the GEMM lane's read order, per K256 block.
+// W4A4 (32 words): word kc * 8 + h * 4 + c of the MMA order (K64 chunk kc, half h, quad lane c) at c * 8 + kc * 2 + h,
+// a lane's 8 words of a step in two 16 B loads instead of 8 scalar ones. W4A8 (64 words, E4M3): word t * 8 + h * 4 + c
+// (K32 step t, half h) at c * 16 + t * 2 + h, a lane's 4 words of a K64 chunk in one 16 B load instead of 4
 __device__ __forceinline__ int aperm(int w) {
-    if constexpr (kA8) return w;
+    if constexpr (kA8) {
+        const int wl = w & 63;
+        return (w - wl) + (wl & 3) * 16 + (wl >> 3) * 2 + ((wl >> 2) & 1);
+    }
     const int wl = w & 31;
     return (w - wl) + (wl & 3) * 8 + (wl >> 3) * 2 + ((wl >> 2) & 1);
 }
@@ -649,10 +657,8 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
                     }
                     uint32_t q4[kQW];
                     s_sc[gi] = quant_fp4(v, q4, ginv1);
-                    if constexpr (kA8)
-                        store_q(s_q + gi * (kSfVec / kXB), q4);
-                    else  // the chunk starts on a K256 block (kDispGroups groups)
-                        store_q_perm(reinterpret_cast<uint32_t *>(s_q), gi * kQW, q4);
+                    // the chunk starts on a K256 block (kDispGroups groups)
+                    store_q_perm(reinterpret_cast<uint32_t *>(s_q), gi * kQW, q4);
                 }
                 __syncthreads();
                 const int nq = ng * kSfVec / kXB / 16, per = nq + ng / 16;  // uint4 per copy: data + scales
@@ -739,12 +745,12 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
     st_[10] = gtime();
     {  // this CTA's first item is static: pull this warp's share of its weights and scales into L2 now. The item is
         // FC1 while the queue head lasts; with few tokens the later CTAs start on FC2 items, whose weights then arrive
-        // while FC1 runs. W4A8: skipped up to 8 tiles. W4A4: at any count (1 token per rank: the weights arrive between
-        // the expert map and the rows, -4 to -5 %)
+        // while FC1 runs. At any tile count (1 token per rank: the weights arrive between the expert map and the rows,
+        // -4 to -6 %)
         const int nblk1 = 2 * I / kRowsPerItem, nblk2 = H / kRowsPerItem;
         const int ntiles = m.tiles_prefix[EL];
         const int item = first_item(blockIdx.x, gridDim.x);
-        if ((!kA8 || ntiles > 8) && item < ntiles * (nblk1 + nblk2)) {
+        if (item < ntiles * (nblk1 + nblk2)) {
             bool l1;
             int tile_g, rb;
             item_decode(item, ntiles, nblk1, nblk2, m.lag, l1, tile_g, rb);
@@ -868,10 +874,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
                     if (tk < ntok) {
                         const size_t r = size_t(el) * TOKE + tile * kT + tk;
                         const int col0 = rb * kItemInter + gi * kSfVec;
-                        if constexpr (kA8)
-                            store_q(a.inter + r * (I / kXB) + col0 / kXB, q4);
-                        else
-                            store_q_perm(reinterpret_cast<uint32_t *>(a.inter + r * (I / kXB)), col0 / 8, q4);
+                        store_q_perm(reinterpret_cast<uint32_t *>(a.inter + r * (I / kXB)), col0 / (4 * kXB), q4);
                         reinterpret_cast<uint8_t *>(a.inter_s + r * (I / kSfWordK))[col0 / kSfVec] = sc;
                     }
                 }
@@ -1424,8 +1427,17 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
         const float e = float(a.T) * a.TOPK / a.EL;
-        if (kA8) {  // swept on 6000D EP8, cold L2, 1-64 tokens per rank: 8 while one sub-tile holds e, 16 beyond
-            nt = e > 8.f ? 2 : 1;
+        if (kA8) {
+            // W4A8: an empirical default, not the optimum (as W4A4 below; W4A8 sweeps in W4A4.md). At EP8 the
+            // I >= 2048 shapes take W4A4's widths, the I 1280 shape 64 from e 48 (32 is not faster than 16 there); at
+            // EP16 16-token items hold out longer than W4A4's (the FP8 rows are twice the bytes per token)
+            if (a.W <= 8) {
+                if (a.I >= 2048) nt = e <= 8.f ? 1 : e < 16.f ? 2 : e < 32.f ? 4 : 8;
+                else nt = e < 16.f ? 1 : e < 48.f ? 2 : 8;
+            } else {
+                if (a.I >= 2048) nt = e <= 12.f ? 1 : e < 48.f ? 2 : 8;
+                else nt = e < 32.f ? 1 : e < 96.f ? 2 : 8;
+            }
         } else {
             // W4A4: an empirical default, not the optimum. Swept on 6000D (two CX8 hosts), cold L2, balanced routing,
             // 8 / 16 / 32 / 64 forced at 1-1024 tokens per rank for four shapes (W4A4.md); re-sweep for another model,
