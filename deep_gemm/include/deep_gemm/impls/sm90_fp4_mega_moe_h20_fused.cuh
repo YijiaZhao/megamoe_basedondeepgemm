@@ -566,8 +566,15 @@ sm90_nvfp4_mega_moe_h200_fused_impl(
         // DG_FE_SELECT_IN_MEGA=1: the Fable cc frontend's compact [token][384] u32 key array (nullptr = topk from the frontend)
         const uint32_t* __restrict__ fe_keys,
         const __grid_constant__ H20Ep16Gin ep16_gin) {
-    constexpr uint32_t kHidden = 3072;
-    constexpr uint32_t kIntermediateHidden = 1280;
+    // H3072/I1280 (default) or H4096/I1536 (host: SM90FP4H20FusedShape::is_supported_h200_shape)
+#ifndef DG_H20_HIDDEN
+#define DG_H20_HIDDEN 3072
+#endif
+#ifndef DG_H20_INTERMEDIATE
+#define DG_H20_INTERMEDIATE 1280
+#endif
+    constexpr uint32_t kHidden = DG_H20_HIDDEN;
+    constexpr uint32_t kIntermediateHidden = DG_H20_INTERMEDIATE;
     // Experts across the kNumRanks NVLink ranks of this launch: 384 (EP8), or 192 when
     // the launch is one node of a two-node EP16 (24 per rank; see deep_gemm/mega/ep16.py).
 #ifndef DG_H20_NUM_EXPERTS

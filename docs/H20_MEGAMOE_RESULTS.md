@@ -101,3 +101,50 @@ Env knobs of this tree (all read once per process; the table above uses the defa
 | `DG_PROFILE_HOST_BARRIER` | 0 | profiling: `dist.barrier()` before each replay when not streamed |
 | `DG_BENCH_FLUSH_L2_BYTES` | 256 MiB | profiling: L2 flush size between replays |
 
+
+## H4096 / I1536 / E640 / top-8, EP8 and two-node EP16 (2026-11-25)
+
+Second supported shape of the fused MXFP4 kernel: hidden 4096, intermediate 1536, 640 experts (80 per rank in EP8,
+40 per rank in EP16), top-8. Global M = tokens before top-k summed over all ranks; the test spreads them evenly
+(`--global-tokens M`: rank r gets rows [M·r/W, M·(r+1)/W)).
+
+| Global M (all ranks) | EP8 tokens/rank | EP8 µs | EP8 MBU | EP16 tokens/rank | EP16 µs | EP16 MBU |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 1 | 78.5 | 30.1% | 0.5 | 110.0 | 10.7% |
+| 16 | 2 | 115.5 | 40.8% | 1 | 129.4 | 18.2% |
+| 24 | 3 | 174.3 | 40.6% | 1.5 | 150.2 | 23.6% |
+| 32 | 4 | 218.3 | 43.2% | 2 | 171.9 | 27.5% |
+| 40 | 5 | 260.8 | 45.2% | 2.5 | 193.7 | 30.5% |
+| 48 | 6 | 300.2 | 47.2% | 3 | 211.9 | 33.4% |
+| 56 | 7 | 341.8 | 48.3% | 3.5 | 234.1 | 35.3% |
+| 64 | 8 | 384.8 | 49.0% | 4 | 260.2 | 36.3% |
+| 72 | 9 | 429.1 | 49.5% | 4.5 | 277.8 | 38.2% |
+| 80 | 10 | 472.1 | 50.0% | 5 | 301.4 | 39.1% |
+| 88 | 11 | 475.5 | 49.6% | 5.5 | 300.0 | 39.3% |
+| 96 | 12 | 476.4 | 49.5% | 6 | 302.8 | 39.0% |
+| 104 | 13 | 478.7 | 49.3% | 6.5 | 303.2 | 38.9% |
+| 112 | 14 | 478.9 | 49.3% | 7 | 303.9 | 38.8% |
+| 120 | 15 | 480.5 | 49.1% | 7.5 | 286.5 | 41.2% |
+| 128 | 16 | 441.0 | 53.5% | 8 | 290.1 | 40.7% |
+
+Method (`tests/test_h20_ep16.py`): forced-balanced routing, one CUDA graph per call, 256 MiB written before every
+replay (cold L2), CUDA-event span of the replay, median of 30 replays per rank, max over the ranks. Inputs are
+already in the symmetric buffer (no frontend, no input quantisation in the span). EP8: the one fused kernel, NVLink
+only, clocks locked at 1830 MHz. EP16: `--transport gin`, the one fused kernel per node with the cross-node exchange
+inside it (NCCL GIN, GDAKI backend, rail peer = same local rank on the other node); its clocks were not locked on
+every host. EP16 rows below 1 token per rank: half of the ranks have 1 row, the others 0. Push dispatch is not
+implemented over GIN, so every EP16 point uses the pull dispatch. MBU = weight bytes of the experts hit (FP4 payload +
+scales as stored) / (ranks × 4.0 TB/s × time).
+
+Correctness: every point above, 2 seeds each, against the exact-quantised reference (FP8 activations, dequantised
+weights, quantised intermediate): cos_min >= 0.99994 (EP16 M56), all others >= 0.99996; norm ratio 0.9999-1.0000.
+
+```bash
+# EP8 (one host)
+torchrun --standalone --nproc-per-node 8 tests/test_h20_ep16.py --mode ep8 --quant mxfp4 \
+  --hidden 4096 --intermediate 1536 --experts 640 --topk 8 --global-tokens 64
+# EP16 (two hosts, node rank 0 / 1)
+torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 8 --master-addr <node0> --master-port 29655 \
+  tests/test_h20_ep16.py --mode ep16 --quant mxfp4 --transport gin \
+  --hidden 4096 --intermediate 1536 --experts 640 --topk 8 --global-tokens 128
+```

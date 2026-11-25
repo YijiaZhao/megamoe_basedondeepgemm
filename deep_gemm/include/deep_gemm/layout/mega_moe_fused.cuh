@@ -54,8 +54,10 @@ static constexpr bool kSM90FusedHalfTileTasks = DG_FUSED_HALF_TILE_TASKS != 0;
 // fixed stride of kPushBlocksPerExpert (2 at <= 16 global tokens) blocks per local
 // expert, so the split-K / stream-K / tiny-M slots indexed by pool block must cover
 // kNumExpertsPerRank * 2 = 96 block indices (the dense block count stays <= 96 too).
-static constexpr uint32_t kSM90SplitKL1MaxPoolBlocks = 96;
-static constexpr uint32_t kSM90SplitKL1NumL1BlockNs = 10;
+// 160: the H4096/I1536/E640 shape has 80 local experts (x 2 push blocks); the
+// N-block counts below are upper bounds (H3072/I1280: 10 / 12, H4096/I1536: 12 / 16).
+static constexpr uint32_t kSM90SplitKL1MaxPoolBlocks = 160;
+static constexpr uint32_t kSM90SplitKL1NumL1BlockNs = 12;
 static constexpr uint32_t kSM90SplitKL1NumKSplits = 2;
 // One partial per (weight row, token): 256 rows x 8 tokens x fp32.
 static constexpr uint32_t kSM90SplitKL1PartialBytes = 256u * 8u * 4u;
@@ -66,7 +68,7 @@ static constexpr uint32_t kSM90SplitKL1NumSlots =
 // accumulator is also 256 hidden rows x 8 tokens (same slot size); the L2 slots
 // live in their own index space (pool_block x 12 BN256 L2 N-blocks) after the L1
 // slots, so the L1 and L2 handshakes of one pool block never share a slot.
-static constexpr uint32_t kSM90SplitKL2NumL2BlockNs = 12;
+static constexpr uint32_t kSM90SplitKL2NumL2BlockNs = 16;
 // Up to 3 K ranges per L2 tail task (DG_FP4_SPLITK_L2=3): n - 1 publisher partial slots per task.
 static constexpr uint32_t kSM90SplitKL2MaxPublishers = 2;
 static constexpr uint32_t kSM90SplitKL2NumSlots =

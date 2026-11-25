@@ -55,6 +55,7 @@ public:
         int l2_task_tiles;
         int num_experts;
         int num_sms;
+        int hidden, intermediate_hidden;
         // Two-node EP16 over NCCL GIN (0: off, else the NCCL GIN type of the rail communicator)
         int ep16_gin_type;
         SM90FP4H20FusedConfig config;
@@ -88,12 +89,16 @@ public:
             "#define DG_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1\n"
             "#define DG_H20_NUM_EXPERTS {}\n"
             "#define DG_H20_NUM_SMS {}\n"
+            "#define DG_H20_HIDDEN {}\n"
+            "#define DG_H20_INTERMEDIATE {}\n"
             "{}"
             "{}"
             "#define sm90_nvfp4_mega_moe_h200_fused_impl {}\n"
             "#include <deep_gemm/impls/sm90_fp4_mega_moe_h20_fused.cuh>",
             args.num_experts,
             args.num_sms,
+            args.hidden,
+            args.intermediate_hidden,
             get_env<int>("DG_FP4_SPIN_TIMEOUT", 0) != 0 ? "#define DG_FUSED_SPIN_TIMEOUT 1\n" : "",
             // NCCL GIN: keep only the rail communicator's backend (NCCL_GIN_TYPE_PROXY 2, GDAKI 3);
             // the NCCL include directory comes from DG_JIT_EXTRA_FLAGS (deep_gemm/mega/ep16.py)
@@ -286,7 +291,8 @@ static void sm90_fp4_h20_fused_mega_moe(
     const int num_global_tokens_upper = num_tokens * num_ranks;
     const bool wide_m_ok = num_global_tokens_upper >= get_env<int>("DG_FP4_BN512_MIN_M", 16) &&
                            num_global_tokens_upper <= get_env<int>("DG_FP4_BN512_MAX_M", 16);
-    const bool wide_request = (mxfp4 || qoq) && wide_m_ok &&
+    // Wide L1 tasks split the L1 tail three ways over K: whole stages only with H3072 (24 K128 blocks)
+    const bool wide_request = (mxfp4 || qoq) && wide_m_ok && hidden == 3072 &&
                               (wide_bn_l1_env == 512 || wide_bn_l2_env == 512);
     const SM90FP4H20FusedInput heuristic_input {
         num_sms,
@@ -488,7 +494,8 @@ static void sm90_fp4_h20_fused_mega_moe(
     const int push_max_tokens_per_rank = std::max(1, (push_max_m + num_ranks - 1) / num_ranks);
     const int push_blocks_per_expert =
         (num_ranks * push_max_tokens_per_rank + config.block_m - 1) / config.block_m;
-    const bool push_dispatch = plan.use_interleaved_scheduler &&
+    // EP16 GIN only implements the pull dispatch.
+    const bool push_dispatch = plan.use_interleaved_scheduler && ep16_gin.empty() &&
         get_env<int>("DG_FP4_PUSH_DISPATCH", 1) != 0 &&
         num_global_tokens_upper <= push_max_m && num_tokens <= push_max_tokens_per_rank &&
         num_experts_per_rank * push_blocks_per_expert * config.block_m <= config.num_max_pool_tokens &&
@@ -681,6 +688,8 @@ static void sm90_fp4_h20_fused_mega_moe(
         .l2_task_tiles = l2_task_tiles,
         .num_experts = num_experts,
         .num_sms = num_sms,
+        .hidden = hidden,
+        .intermediate_hidden = intermediate_hidden,
         .ep16_gin_type = ep16_gin.empty() ? 0 : static_cast<int>(ep16_gin[5]),
         .config = config,
         .y = y.data_ptr(),

@@ -35,6 +35,7 @@
     //   EP16 GIN: 48 max input put issued | 49 max peer input rows seen | 50 max peer rows copied in
     //   51 min first own-row wait for the peer's partial | 52 max last peer partial seen
     //   53 min first combined peer row put | 54 max last combined peer row put
+    //   55 max own rows packed into the send region (per packing warp)
     const auto stamp_min = [&](const uint32_t slot) {
         if (phase_stamps != nullptr) {
             unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -445,14 +446,14 @@
     DG_STATIC_ASSERT(!kSplitKL1 ||
                      (kRFDecode && (kKBlocksPerStage >= 2 || kWideTiles) && kNumEpilogueWarpgroups == 2 &&
                       ((L1_SHAPE_K / BLOCK_K) % (kNumL1KSplits * kKBlocksPerStage)) == 0 &&
-                      (L1_SHAPE_N / TASK_BLOCK_N) * kL1Tiles == fused_layout::kSM90SplitKL1NumL1BlockNs),
-                     "Split-K L1: RF decode, multi-K-block stages, K halves of whole stages, 10 L1 N-blocks (5 wide)");
+                      (L1_SHAPE_N / TASK_BLOCK_N) * kL1Tiles <= fused_layout::kSM90SplitKL1NumL1BlockNs),
+                     "Split-K L1: RF decode, multi-K-block stages, K halves of whole stages, L1 N-blocks fit the slots");
     DG_STATIC_ASSERT(!kSplitKL2 ||
                      (kRFDecode && kKBlocksPerStage >= 2 && kNumEpilogueWarpgroups == 2 &&
                       (L2_SHAPE_K / BLOCK_K) >= 2 * kKBlocksPerStage &&
-                      L2_SHAPE_N / TASK_BLOCK_N_L2 == fused_layout::kSM90SplitKL2NumL2BlockNs &&
+                      L2_SHAPE_N / TASK_BLOCK_N_L2 <= fused_layout::kSM90SplitKL2NumL2BlockNs &&
                       L2_WG_BLOCK_N == WG_BLOCK_N),
-                     "Split-K L2: RF decode, multi-K-block stages, >= 2 whole stages, 12 L2 N-blocks, full-row L2 tasks");
+                     "Split-K L2: RF decode, multi-K-block stages, >= 2 whole stages, L2 N-blocks fit the slots, full-row L2 tasks");
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -1148,6 +1149,7 @@
                     }
                     __syncwarp();
                     if (lane_idx == 0) {
+                        stamp_max(55);
                         __threadfence_system();
                         auto* counter = reinterpret_cast<uint32_t*>(ep16_gin.base + ep16_epoch_off + 4);
                         if (atomicAdd(counter, 1u) + 1u == num_send_warps) {

@@ -36,6 +36,11 @@ struct SM90FP4H20FusedShape {
     static constexpr int kTopk = 8;
     static constexpr int kHidden = 3072;
     static constexpr int kIntermediateHidden = 1280;
+    // Second supported shape: H4096 / I1536 / E640 (80 experts per rank, 40 per node rank in EP16)
+    static constexpr int kHidden2 = 4096;
+    static constexpr int kIntermediateHidden2 = 1536;
+    static constexpr int kExpertsPerRank2 = 80;
+    static constexpr int kEP16ExpertsPerRank2 = 40;
 
     int num_sms;
     int num_ranks;
@@ -53,11 +58,11 @@ struct SM90FP4H20FusedShape {
         // concurrent NCCL kernel (see deep_gemm/mega/ep16.py).
         return num_sms <= kH200NumSMs && num_sms >= kH200NumSMs - 8 &&
             num_ranks == kNumRanks &&
-            (num_experts == kExpertsPerRank * kNumRanks ||
-             num_experts == kEP16ExpertsPerRank * kNumRanks) &&
             num_topk == kTopk &&
-            hidden == kHidden &&
-            intermediate_hidden == kIntermediateHidden;
+            ((hidden == kHidden && intermediate_hidden == kIntermediateHidden &&
+              (num_experts == kExpertsPerRank * kNumRanks || num_experts == kEP16ExpertsPerRank * kNumRanks)) ||
+             (hidden == kHidden2 && intermediate_hidden == kIntermediateHidden2 &&
+              (num_experts == kExpertsPerRank2 * kNumRanks || num_experts == kEP16ExpertsPerRank2 * kNumRanks)));
     }
 };
 
@@ -96,7 +101,9 @@ select_sm90_nvfp4_h200_fused(
     DG_HOST_ASSERT(input.shape().is_supported_h200_shape());
     DG_HOST_ASSERT(
         input.num_experts_per_rank == SM90FP4H20FusedShape::kExpertsPerRank ||
-        input.num_experts_per_rank == SM90FP4H20FusedShape::kEP16ExpertsPerRank);
+        input.num_experts_per_rank == SM90FP4H20FusedShape::kEP16ExpertsPerRank ||
+        input.num_experts_per_rank == SM90FP4H20FusedShape::kExpertsPerRank2 ||
+        input.num_experts_per_rank == SM90FP4H20FusedShape::kEP16ExpertsPerRank2);
     DG_HOST_ASSERT(input.num_experts ==
                    input.num_experts_per_rank * input.num_ranks);
     DG_HOST_ASSERT(input.num_max_tokens_per_rank > 0);
@@ -145,6 +152,9 @@ select_sm90_nvfp4_h200_fused(
         tuning = {128, 128, 48, 6, SM90ArchSpec::smem_capacity,
                   false, true, false};
 
+    // The waves above are tuned for 48 / 24 experts per rank; other counts take the largest divisor <= it
+    while (input.num_experts_per_rank % tuning.num_experts_per_wave != 0)
+        -- tuning.num_experts_per_wave;
     DG_HOST_ASSERT(
         input.num_experts_per_rank % tuning.num_experts_per_wave == 0);
     DG_HOST_ASSERT(tuning.smem_size <= SM90ArchSpec::smem_capacity);

@@ -347,6 +347,9 @@ kernel, with the forced-balanced routing written by one memcpy node in between (
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
+H20 second shape (H4096 / I1536 / E640 / top-8, MXFP4 fused, global M = 8..128): EP8 and two-node EP16 (NCCL GIN),
+full table, method and correctness in [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md#h4096--i1536--e640--top-8-ep8-and-two-node-ep16-2026-11-25).
+
 SM120 (8x RTX 6000D, PCIe P2P, no NVLink; host: [SM120 test host](#sm120-test-host-8x-rtx-6000d)): `fp4_mega_moe_sm120`,
 one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4, over PCIe P2P or, for peers on
 another host, the NIC (NCCL GIN), up to 16 ranks. This README's shape, EP8, cold L2
