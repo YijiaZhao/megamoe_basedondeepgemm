@@ -167,9 +167,11 @@ MODEL_DIR=/raid/models TRANSPORT=lsa_where_reachable EPLB=1 DENSE_OPT=0 bash lau
 - `NCCL_IB_HCA` 列出 8 个数据口（默认 `mlx5_0`…`mlx5_7`；不要用管理网的 `mlx5_bond_0`），`ibdev2netdev` 确认都是 Up；
 - 容器 `--device /dev/infiniband --cap-add IPC_LOCK --ulimit memlock=-1`；
 - `NCCL_CUMEM_ENABLE=1`（NCCL Device API 需要；SGLang 默认设成 0，否则报 `the NCCL communicator does not support the Device API`）；
+- `NCCL_IB_TC` 设成网络的无损流量类（CX8aaS 机型是 `96`，即 DSCP 24、优先级 3）：GIN（GDAKI）的连接不继承网口的全局 tclass，
+  不设时走有损的优先级 0，EP16 下会丢包，个别 rank 慢 1–100 ms（见 `../ENV.md`）。这一项在 kernel 的 EP16 bench 上验证过，SGLang 端到端没有单独测；
 - 主机加载 `nvidia_peermem`。
 
-`launch.sh` 在 `TRANSPORT` 不是 `p2p` 时自动加上前三项。Broadcom 交换芯片的机型（例如 .20）用默认 `p2p`。
+`launch.sh` 在 `TRANSPORT` 不是 `p2p` 时自动加上前四项（`NCCL_IB_TC` 默认 `96`，可用同名环境变量覆盖）。Broadcom 交换芯片的机型（例如 .20）用默认 `p2p`。
 
 启动日志里每个 rank 有两种形状各一行 `SM120 MegaMoE buffer: EP8, 384 experts / top-6 (slot 0), transport ...`（draft 是
 `128 experts / top-3 (slot 1)`），以及 `SM120 MegaMoE: first call on the mega kernel path (384 experts, 96 local tokens)`。

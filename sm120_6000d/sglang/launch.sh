@@ -84,8 +84,11 @@ if [ "$MEGA" = 1 ]; then
          -e SGLANG_SM120_MEGA_MOE_TRANSPORT=$TRANSPORT -e SGLANG_SM120_MEGA_MOE_PACKED=${PACKED:-0}
          -e SGLANG_SM120_FUSED_ROUTER=${FUSED_ROUTER:-0})
   if [ "$TRANSPORT" != p2p ]; then
-    # NCCL GIN needs the NCCL Device API, which needs cuMem (SGLang otherwise sets NCCL_CUMEM_ENABLE=0)
-    ENVS+=(-e NCCL_CUMEM_ENABLE=1 -e NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7})
+    # NCCL GIN needs the NCCL Device API, which needs cuMem (SGLang otherwise sets NCCL_CUMEM_ENABLE=0). NCCL_IB_TC:
+    # the GIN (GDAKI) queue pairs do not take the port's global traffic class; 96 = the CX8 hosts' lossless priority 3
+    # (unset: lossy priority 0, drops at EP16; ../ENV.md)
+    ENVS+=(-e NCCL_CUMEM_ENABLE=1 -e NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}
+           -e NCCL_IB_TC=${NCCL_IB_TC:-96})
     DEV=(--device /dev/infiniband --cap-add IPC_LOCK)
   fi
 fi
