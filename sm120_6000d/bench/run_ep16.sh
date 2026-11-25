@@ -10,7 +10,7 @@ set -e
 NODE_RANK=$1; shift
 ROOT=${ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}
 docker run --rm -u root --gpus all --ipc host --network host --ulimit memlock=-1 --cap-add IPC_LOCK --device /dev/infiniband \
-  -e TILE=${TILE:-0} -e NCCL_SOCKET_IFNAME=${IFNAME:-bond0} ${HCA:+-e NCCL_IB_HCA=$HCA} \
+  -e TILE=${TILE:-0} -e BENCH_SHAPE=${BENCH_SHAPE:-readme} -e NCCL_SOCKET_IFNAME=${IFNAME:-bond0} ${HCA:+-e NCCL_IB_HCA=$HCA} \
   -e NCCL_DEBUG=${NCCL_DEBUG:-WARN} -e DG_SM120_MEGA_MOE_BUILD_DIR=/w/build \
   -v "$ROOT":/w -w /w --entrypoint bash ${IMAGE:-toklin/vllm-sm120:e10ecb6bd-p3} -c \
   "timeout ${TIMEOUT:-1800} torchrun --nnodes 2 --node-rank $NODE_RANK --nproc-per-node ${NPROC:-8} \

@@ -4,7 +4,8 @@
 #       readme: the README shape H3072 / I1280 / E384 / top-8; wide: H5120 / I256 / E128 / top-6, the token goes
 #       out in several dispatch chunks)
 #   torchrun --nproc_per_node=8 tests/test_mega_moe_sm120_fp4.py bench nvfp4 2 4 8 16 64 256 512 1024
-#       cold-L2 kernel time, README shape, global M tokens (TILE=8/16 forces the tokens per item); `w4a8` is this
+#       cold-L2 kernel time, README shape (BENCH_SHAPE=<a SHAPES key> for another), global M tokens (TILE=8/16/32/64
+#       forces the tokens per item); `w4a8` is this
 #       kernel with MXFP8 activations; `stamps` instead of `bench` prints the per-phase kernel stamps
 #   Either mode takes a transport among its arguments (p2p, the default, or a transport table of
 #   deep_gemm/mega/sm120_fp4.py TRANSPORTS: all_gin / all_lsa / lsa_where_reachable / auto / tuned), e.g.
@@ -113,6 +114,8 @@ SHAPES = {  # hidden, intermediate, experts, top-k
     'wide': (5120, 256, 128, 6),
     'dsv41': (5120, 2304, 384, 6),  # DeepSeek-V4.1-Flash routed experts
     'dsv41_eplb16': (5120, 2304, 400, 6),  # DeepSeek-V4.1-Flash with 16 redundant experts (EPLB)
+    'dsv4flash': (4096, 2048, 256, 6),  # DeepSeek-V4-Flash routed experts
+    'glm53flash': (4096, 2048, 256, 8),  # GLM-5.3-Flash routed experts
 }
 
 
@@ -153,7 +156,7 @@ def verify(fmt, shape, rank, world, group, transport):
         x = (torch.randn(t, h, device='cuda', generator=torch.Generator(device='cuda').manual_seed(5 + rank + trial))
              * 0.5).bfloat16()
         ref = reference(x, ids, wts, lambda g: expert_codes(g, h, i, fmt), i, fmt)
-        for tile in (0, 8, 16):  # 0: the automatic choice
+        for tile in (0, 8, 16, 32, 64):  # 0: the automatic choice
             y = torch.zeros(t, h, device='cuda', dtype=torch.bfloat16)
             for _ in range(2):  # the second call checks the per-call state was reset
                 fp4.fp4_mega_moe_sm120(y, x, ids, wts, l1, l2, buf, gs, activation_clamp=LIMIT, tile_tokens=tile)
@@ -174,12 +177,13 @@ STAMPS = [(8, 'route-push'), (1, 'dispatched'), (12, 'flag-sent'), (9, 'route-ok
 
 
 def bench(fmt, rank, world, group, ms, transport, stamps=False):
-    """README shape and method (the H20 / B200 tables' L2 flush): global M tokens over the
+    """README shape (or BENCH_SHAPE) and method (the H20 / B200 tables' L2 flush): global M tokens over the
     ranks (one row per rank up to M = world), balanced routing with weight 1/top-k: copy s of global token g goes to
-    rank s * world / top-k + g % (world / top-k) (rank s at EP8), local expert (g + 7 s) % EL.
+    rank s * world / top-k + g % (world / top-k) (rank s at EP8; (g * top-k + s) % world when top-k does not divide
+    the world), local expert (g + 7 s) % EL.
     Cold L2: 256 MB written before each graph replay, ranks released by a barrier, median of 30 replays, median over
     3 passes."""
-    h, i, e, topk = SHAPES['readme']
+    h, i, e, topk = SHAPES[os.environ.get('BENCH_SHAPE', 'readme')]
     el = e // world
     gen = torch.Generator(device='cuda').manual_seed(20261023 + rank)
     vec, sf = (32, 124) if fmt != 'nvfp4' else (16, 0x38)
@@ -187,8 +191,10 @@ def bench(fmt, rank, world, group, ms, transport, stamps=False):
     w2 = torch.randint(0, 256, (el, h, i // 2), device='cuda', dtype=torch.uint8, generator=gen)
     l1 = (w13, torch.full((el, 2 * i, h // vec), sf, device='cuda', dtype=torch.uint8))
     l2 = (w2, torch.full((el, h, i // vec), sf, device='cuda', dtype=torch.uint8))
-    assert world % topk == 0, 'the balanced routing needs a world that is a multiple of top-k'
-    stride = world // topk  # copy s of global token g goes to rank s * stride + g % stride
+    # copy s of global token g goes to rank s * stride + g % stride; a world that is not a multiple of top-k: rank
+    # (g * top-k + s) % world (the k copies still reach k different ranks)
+    stride = world // topk if world % topk == 0 else 0
+    dest = (lambda g, s: s * stride + g % stride) if stride else (lambda g, s: (g * topk + s) % world)
     cap = max(max(1, m // world) for m in ms)
     tile = int(os.environ.get('TILE', '0'))
     gs = fp4.nvfp4_global_scales(A1, A2, torch.full((el,), 0.06, device='cuda'),
@@ -204,7 +210,7 @@ def bench(fmt, rank, world, group, ms, transport, stamps=False):
         for r in range(rows):
             gi = rank * rows + r
             if gi < m:
-                ids[r] = torch.tensor([(s * stride + gi % stride) * el + (gi + 7 * s) % el for s in range(topk)],
+                ids[r] = torch.tensor([dest(gi, s) * el + (gi + 7 * s) % el for s in range(topk)],
                                       dtype=torch.int32)
         ids = ids.cuda()
         wts = torch.full((rows, topk), 1.0 / topk, device='cuda')

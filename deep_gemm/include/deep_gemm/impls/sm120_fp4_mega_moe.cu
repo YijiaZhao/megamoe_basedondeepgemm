@@ -79,7 +79,7 @@ constexpr int kWarps = 8;
 constexpr int kNbPerWarp = 1;
 constexpr int kRowsPerItem = kWarps * kNbPerWarp * 16;  // 128 weight rows per work item
 constexpr int kTile = 8;                                // tokens per MMA (N); an item takes NT of them
-constexpr int kMaxNt = 2;
+constexpr int kMaxNt = 8;
 constexpr size_t kPf0Bytes = size_t(64) << 20;          // t=0 L2 prefetch budget over the locally known experts
 constexpr int kUnroll = 4;
 constexpr int kMaxWorld = 16;
@@ -90,7 +90,7 @@ constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRou
 constexpr int kCtrDispatch = 0, kCtrQueue = 1, kCtrL2Done = 2, kCtrErr = 3, kCtrExit = 4, kCtrEpoch = 5;
 constexpr int kCtrFlag = 8, kCtrL1 = 16;  // kCtrFlag: local copies (epoch) of the route / rows / combine flags
 // GIN: FC2 items done per tile (reset per call), cumulative signal totals received per kind and source (u64, kept)
-constexpr int kMaxTiles = 2304;  // sum over local experts of ceil(rows / 8): EL + W * TCAP * TOPK / 8, TCAP <= 64
+constexpr int kMaxTiles = 16640;  // sum over local experts of ceil(rows / 8): EL + W * TCAP * TOPK / 8 (TCAP 1024 at EP16, top-8)
 constexpr int kCtrTile = kCtrL1 + kMaxEl, kCtrCum = kCtrTile + kMaxTiles;
 constexpr int kCtrInts = kCtrCum + 2 * 3 * kMaxWorld;
 static_assert(kCtrCum % 2 == 0, "the cumulative GIN totals must be 8-byte aligned");
@@ -301,6 +301,25 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
         } else {
             load(k0, wv, sfa);
         }
+        // W4A4: this step's activations (aperm order): lane c's 8 words of the K256 block in two 16 B loads, the scale
+        // words in one 16 B (NVFP4) / 8 B (MXFP4) load
+        uint4 av[kA8 ? 1 : NT][2];
+        uint32_t asf[kA8 ? 1 : NT][kSw];
+        if constexpr (!kA8) {
+#pragma unroll
+            for (int s = 0; s < NT; ++s) {
+                const uint4 *x4 = reinterpret_cast<const uint4 *>(xrow[s]) + (k0 / 4) * 8 + c * 2;
+                av[s][0] = x4[0];
+                av[s][1] = x4[1];
+                if constexpr (kNv) {
+                    const uint4 t = *reinterpret_cast<const uint4 *>(xsrow[s] + k0);
+                    asf[s][0] = t.x, asf[s][1] = t.y, asf[s][2 % kSw] = t.z, asf[s][3 % kSw] = t.w;
+                } else {
+                    const uint2 t = *reinterpret_cast<const uint2 *>(xsrow[s] + k0 / 2);
+                    asf[s][0] = t.x, asf[s][1 % kSw] = t.y;
+                }
+            }
+        }
 #pragma unroll
         for (int u = 0; u < kUnroll; ++u) {
             const int kc = k0 + u;
@@ -331,9 +350,9 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const
             uint32_t b0[NT], b1[NT], sfb[NT];
 #pragma unroll
             for (int s = 0; s < NT; ++s) {
-                b0[s] = xrow[s][kc * 8 + c];
-                b1[s] = xrow[s][kc * 8 + 4 + c];
-                sfb[s] = kNv ? xsrow[s][kc] : xsrow[s][kc / 2] >> ((kc & 1) * 16);
+                b0[s] = u & 1 ? av[s][u / 2].z : av[s][u / 2].x;
+                b1[s] = u & 1 ? av[s][u / 2].w : av[s][u / 2].y;
+                sfb[s] = kNv ? asf[s][u] : asf[s][u / 2] >> ((u & 1) * 16);
             }
 #pragma unroll
             for (int j = 0; j < kNbPerWarp; ++j) {
@@ -422,6 +441,19 @@ __device__ __forceinline__ void store_q(uint8_t *dst, const uint32_t (&q)[kQW]) 
     }
 }
 
+// W4A4 activation rows (the staged token rows and the FC1 output): within each K256 block (32 words) word kc * 8 +
+// h * 4 + c of the MMA order (K64 chunk kc, half h, quad lane c) is stored at c * 8 + kc * 2 + h, so the GEMM reads a
+// lane's 8 words of a step in two 16 B loads instead of 8 scalar ones. W4A8 keeps the plain order
+__device__ __forceinline__ int aperm(int w) {
+    if constexpr (kA8) return w;
+    const int wl = w & 31;
+    return (w - wl) + (wl & 3) * 8 + (wl >> 3) * 2 + ((wl >> 2) & 1);
+}
+__device__ __forceinline__ void store_q_perm(uint32_t *row, int w0, const uint32_t (&q)[kQW]) {
+#pragma unroll
+    for (int j = 0; j < kQW; ++j) row[aperm(w0 + j)] = q[j];
+}
+
 struct Map {  // per-expert token bookkeeping, built identically by every CTA after the routing exchange
     int cnt[kMaxWorld][kMaxEl];
     int ne[kMaxEl];
@@ -464,15 +496,17 @@ __device__ __forceinline__ int first_item(unsigned block, unsigned grid) { retur
 
 template <int NT>  // tokens per item: NT x 8
 // two CTAs per SM (the grid is sized from the occupancy): the register budget is 128, which the unrolled weight loop
-// uses to keep loads in flight
-__global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args a) {
+// uses to keep loads in flight. 64 tokens per item: one CTA per SM, 255 registers (at 128 the accumulators and the
+// step's activations spill)
+__global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_moe_kernel(Args a) {
     constexpr int kT = kTile * NT;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int H = a.H, I = a.I, EL = a.EL, W = a.W, TOPK = a.TOPK, TCAP = a.TCAP;
     __shared__ Map m;
     __shared__ int s_item, s_ok, s_epoch, s_last;
     // L1: [tok][64 inter] / L2: [tok][128 hidden] fp32 / dispatch: one FP4 token row (H/2 + H/kSfVec bytes)
-    __shared__ __align__(16) float s_tile[kT][kRowsPerItem];
+    extern __shared__ __align__(16) float s_dyn[];  // [kT][kRowsPerItem]: tile_smem(NT) bytes at launch
+    float (*s_tile)[kRowsPerItem] = reinterpret_cast<float (*)[kRowsPerItem]>(s_dyn);
 
     unsigned long long st_[16] = {gtime()};  // 0 start 1 pushed 2 flags 3 work end 4 comb flags 5 end 6 L1-wait ns 7 items 8 route-push 9 route-ok 10 map 11 pf 12 flag-sent 13 last FC1 14 first FC2 15 comb release
     if (threadIdx.x == 0) {
@@ -615,7 +649,10 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                     }
                     uint32_t q4[kQW];
                     s_sc[gi] = quant_fp4(v, q4, ginv1);
-                    store_q(s_q + gi * (kSfVec / kXB), q4);
+                    if constexpr (kA8)
+                        store_q(s_q + gi * (kSfVec / kXB), q4);
+                    else  // the chunk starts on a K256 block (kDispGroups groups)
+                        store_q_perm(reinterpret_cast<uint32_t *>(s_q), gi * kQW, q4);
                 }
                 __syncthreads();
                 const int nq = ng * kSfVec / kXB / 16, per = nq + ng / 16;  // uint4 per copy: data + scales
@@ -702,11 +739,12 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
     st_[10] = gtime();
     {  // this CTA's first item is static: pull this warp's share of its weights and scales into L2 now. The item is
         // FC1 while the queue head lasts; with few tokens the later CTAs start on FC2 items, whose weights then arrive
-        // while FC1 runs. Skipped up to 8 tiles, where it only delays the rows wait
+        // while FC1 runs. W4A8: skipped up to 8 tiles. W4A4: at any count (1 token per rank: the weights arrive between
+        // the expert map and the rows, -4 to -5 %)
         const int nblk1 = 2 * I / kRowsPerItem, nblk2 = H / kRowsPerItem;
         const int ntiles = m.tiles_prefix[EL];
         const int item = first_item(blockIdx.x, gridDim.x);
-        if (ntiles > 8 && item < ntiles * (nblk1 + nblk2)) {
+        if ((!kA8 || ntiles > 8) && item < ntiles * (nblk1 + nblk2)) {
             bool l1;
             int tile_g, rb;
             item_decode(item, ntiles, nblk1, nblk2, m.lag, l1, tile_g, rb);
@@ -830,7 +868,10 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_fp4_mega_moe_kernel(Args
                     if (tk < ntok) {
                         const size_t r = size_t(el) * TOKE + tile * kT + tk;
                         const int col0 = rb * kItemInter + gi * kSfVec;
-                        store_q(a.inter + r * (I / kXB) + col0 / kXB, q4);
+                        if constexpr (kA8)
+                            store_q(a.inter + r * (I / kXB) + col0 / kXB, q4);
+                        else
+                            store_q_perm(reinterpret_cast<uint32_t *>(a.inter + r * (I / kXB)), col0 / 8, q4);
                         reinterpret_cast<uint8_t *>(a.inter_s + r * (I / kSfWordK))[col0 / kSfVec] = sc;
                     }
                 }
@@ -1222,10 +1263,15 @@ struct State {
 };
 static State g;
 
+constexpr int tile_smem(int nt) { return nt * kTile * kRowsPerItem * 4; }  // the kernel's s_tile
+
 template <int NT>
 static int grid_for(int sms) {
+    CHECK_CUDA(cudaFuncSetAttribute(sm120_fp4_mega_moe_kernel<NT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    tile_smem(NT)));
     int occ = 0;
-    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, sm120_fp4_mega_moe_kernel<NT>, kWarps * 32, 0));
+    CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, sm120_fp4_mega_moe_kernel<NT>, kWarps * 32,
+                                                             tile_smem(NT)));
     return occ * sms;
 }
 
@@ -1234,7 +1280,8 @@ static size_t align_up(size_t v) { return (v + 255) & ~size_t(255); }
 // the buffer's layout (the same on every rank); with `window`, the GIN staging regions follow
 static void layout(int rank, int world, int EL, int TCAP, int H, int I, int TOPK, bool window) {
     TORCH_CHECK(world <= kMaxWorld && EL <= kMaxEl && TOPK <= 8, "world / experts / top-k out of range");
-    TORCH_CHECK(H % kRowsPerItem == 0 && I % kRowsPerItem == 0 && H % (16 * kSfVec) == 0,
+    // K256 steps of the GEMM loop (and the W4A4 activation vector loads): H and I multiples of 256
+    TORCH_CHECK(H % kRowsPerItem == 0 && I % kRowsPerItem == 0 && H % (16 * kSfVec) == 0 && H % 256 == 0 && I % 256 == 0,
                 "unsupported hidden / intermediate size");
     g.rank = rank, g.world = world, g.EL = EL, g.TCAP = TCAP, g.H = H, g.I = I, g.TOPK = TOPK;
     const size_t rows = size_t(EL) * world * TCAP;
@@ -1246,7 +1293,8 @@ static void layout(int rank, int world, int EL, int TCAP, int H, int I, int TOPK
     g.off_route = o; o = align_up(o + 2 * size_t(world) * EL * 4);  // two halves, by epoch parity
     g.off_rtflag = o; o = align_up(o + size_t(world) * 4);
     if (window) {
-        TORCH_CHECK(EL + world * TCAP * TOPK / kTile <= kMaxTiles, "the NIC transport takes at most 64 tokens per rank");
+        TORCH_CHECK(EL + world * TCAP * TOPK / kTile <= kMaxTiles, "the NIC transport's tile table holds ", kMaxTiles,
+                    " tiles: local experts + ranks x max tokens per rank x top-k / 8 exceeds it");
         g.st_route = o; o = align_up(o + 2 * size_t(world) * EL * 4);
         g.st_row = o; o = align_up(o + size_t(world) * TCAP * TOPK * pool_rx(H));
         g.st_comb = o; o = align_up(o + size_t(world) * TCAP * TOPK * H * 2);
@@ -1270,7 +1318,7 @@ static void setup_local() {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
     const int sms = prop.multiProcessorCount;
-    g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms);
+    g.grid[1] = grid_for<1>(sms), g.grid[2] = grid_for<2>(sms), g.grid[4] = grid_for<4>(sms), g.grid[8] = grid_for<8>(sms);
 }
 
 // P2P transport: one cudaMalloc, shared over cudaIpc; returns this rank's handle bytes (open_peers takes everyone's)
@@ -1372,19 +1420,29 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     TORCH_CHECK(a.T <= g.TCAP, "T exceeds TCAP");
     a.H = g.H, a.I = g.I, a.EL = g.EL, a.W = g.world, a.TOPK = g.TOPK, a.TCAP = g.TCAP, a.rank = g.rank;
     a.swiglu_limit = float(swiglu_limit);
-    // tokens per item: 0 = from the expected tokens per local expert (this rank's T, uniform routing)
+    // tokens per item: 0 = from the expected tokens per local expert e (this rank's T, uniform routing)
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
-        const float per_expert = float(a.T) * a.TOPK / a.EL;
-        // swept on 6000D EP8, cold L2, 1-64 tokens per rank, every format: 8 while one sub-tile holds an expert's
-        // tokens, 16 beyond
-        nt = per_expert > 8.f ? 2 : 1;
+        const float e = float(a.T) * a.TOPK / a.EL;
+        if (kA8) {  // swept on 6000D EP8, cold L2, 1-64 tokens per rank: 8 while one sub-tile holds e, 16 beyond
+            nt = e > 8.f ? 2 : 1;
+        } else {
+            // W4A4, swept on 6000D EP8, cold L2, 128-1024 tokens per rank, 16 / 32 / 64 forced per shape (W4A4.md):
+            // experts of I >= 2048 gain from wide items early (fewer passes of the expert's weights through L2); the
+            // I 1280 shape is bound by the weight stream and keeps 16 up to e 48
+            if (e <= 8.f) nt = 1;
+            else if (a.I >= 2048) nt = e < 16.f ? 2 : e < 32.f ? 4 : 8;
+            else nt = e < 48.f ? 2 : 4;
+        }
     }
-    TORCH_CHECK(nt >= 1 && nt <= kMaxNt && (tile_tokens <= 0 || tile_tokens == nt * kTile), "tile_tokens: 8 or 16");
+    TORCH_CHECK((nt == 1 || nt == 2 || nt == 4 || nt == 8) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
+                "tile_tokens: 8, 16, 32 or 64");
     auto stream = c10::cuda::getCurrentCUDAStream();
     switch (nt) {
-        case 1: sm120_fp4_mega_moe_kernel<1><<<g.grid[1], kWarps * 32, 0, stream>>>(a); break;
-        default: sm120_fp4_mega_moe_kernel<2><<<g.grid[2], kWarps * 32, 0, stream>>>(a); break;
+        case 1: sm120_fp4_mega_moe_kernel<1><<<g.grid[1], kWarps * 32, tile_smem(1), stream>>>(a); break;
+        case 2: sm120_fp4_mega_moe_kernel<2><<<g.grid[2], kWarps * 32, tile_smem(2), stream>>>(a); break;
+        case 4: sm120_fp4_mega_moe_kernel<4><<<g.grid[4], kWarps * 32, tile_smem(4), stream>>>(a); break;
+        default: sm120_fp4_mega_moe_kernel<8><<<g.grid[8], kWarps * 32, tile_smem(8), stream>>>(a); break;
     }
     CHECK_CUDA(cudaGetLastError());
 }
