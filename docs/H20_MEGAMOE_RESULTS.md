@@ -104,44 +104,48 @@ Env knobs of this tree (all read once per process; the table above uses the defa
 
 ## H4096 / I1536 / E640 / top-8, EP8 and two-node EP16 (2026-11-25)
 
-Second supported shape of the fused MXFP4 kernel: hidden 4096, intermediate 1536, 640 experts (80 per rank in EP8,
-40 per rank in EP16), top-8. Global M = tokens before top-k summed over all ranks; the test spreads them evenly
+Hidden 4096, intermediate 1536, 640 experts (80 per rank in EP8, 40 per rank in EP16), top-8, MXFP4. EP8: the v2
+kernel (`deep_gemm.mega.h20_v2.mxfp4_mega_moe_h20_v2`, `sm90_fp4_mega_moe_h20_v2.cu`: two independent CTAs per SM,
+each two RS-wgmma warpgroups + a producer warp streaming weight blocks (bulk copy) and token blocks (TMA, 128B swizzle)
+through a 4-stage ring, epoch flags instead of cross-rank barriers). EP16: the fused kernel (`mxfp4_mega_moe_fused`,
+NCCL GIN), not ported to v2 yet. Global M = tokens before top-k summed over all ranks; the test spreads them evenly
 (`--global-tokens M`: rank r gets rows [M·r/W, M·(r+1)/W)).
 
 | Global M (all ranks) | EP8 tokens/rank | EP8 µs | EP8 MBU | EP16 tokens/rank | EP16 µs | EP16 MBU |
 |---:|---:|---:|---:|---:|---:|---:|
-| 8 | 1 | 78.5 | 30.1% | 0.5 | 110.0 | 10.7% |
-| 16 | 2 | 115.5 | 40.8% | 1 | 129.4 | 18.2% |
-| 24 | 3 | 174.3 | 40.6% | 1.5 | 150.2 | 23.6% |
-| 32 | 4 | 218.3 | 43.2% | 2 | 171.9 | 27.5% |
-| 40 | 5 | 260.8 | 45.2% | 2.5 | 193.7 | 30.5% |
-| 48 | 6 | 300.2 | 47.2% | 3 | 211.9 | 33.4% |
-| 56 | 7 | 341.8 | 48.3% | 3.5 | 234.1 | 35.3% |
-| 64 | 8 | 384.8 | 49.0% | 4 | 260.2 | 36.3% |
-| 72 | 9 | 429.1 | 49.5% | 4.5 | 277.8 | 38.2% |
-| 80 | 10 | 472.1 | 50.0% | 5 | 301.4 | 39.1% |
-| 88 | 11 | 475.5 | 49.6% | 5.5 | 300.0 | 39.3% |
-| 96 | 12 | 476.4 | 49.5% | 6 | 302.8 | 39.0% |
-| 104 | 13 | 478.7 | 49.3% | 6.5 | 303.2 | 38.9% |
-| 112 | 14 | 478.9 | 49.3% | 7 | 303.9 | 38.8% |
-| 120 | 15 | 480.5 | 49.1% | 7.5 | 286.5 | 41.2% |
-| 128 | 16 | 441.0 | 53.5% | 8 | 290.1 | 40.7% |
+| 8 | 1 | 77.4 | 30.5% | 0.5 | 110.0 | 10.7% |
+| 16 | 2 | 106.2 | 44.4% | 1 | 129.4 | 18.2% |
+| 24 | 3 | 136.0 | 52.0% | 1.5 | 150.2 | 23.6% |
+| 32 | 4 | 161.1 | 58.6% | 2 | 171.9 | 27.5% |
+| 40 | 5 | 190.8 | 61.8% | 2.5 | 193.7 | 30.5% |
+| 48 | 6 | 223.0 | 63.5% | 3 | 211.9 | 33.4% |
+| 56 | 7 | 251.0 | 65.8% | 3.5 | 234.1 | 35.3% |
+| 64 | 8 | 281.5 | 67.1% | 4 | 260.2 | 36.3% |
+| 72 | 9 | 307.7 | 69.0% | 4.5 | 277.8 | 38.2% |
+| 80 | 10 | 337.2 | 70.0% | 5 | 301.4 | 39.1% |
+| 88 | 11 | 337.3 | 69.9% | 5.5 | 300.0 | 39.3% |
+| 96 | 12 | 337.3 | 69.9% | 6 | 302.8 | 39.0% |
+| 104 | 13 | 337.4 | 69.9% | 6.5 | 303.2 | 38.9% |
+| 112 | 14 | 338.5 | 69.7% | 7 | 303.9 | 38.8% |
+| 120 | 15 | 337.9 | 69.8% | 7.5 | 286.5 | 41.2% |
+| 128 | 16 | 338.1 | 69.8% | 8 | 290.1 | 40.7% |
 
-Method (`tests/test_h20_ep16.py`): forced-balanced routing, one CUDA graph per call, 256 MiB written before every
+Method (`tests/test_h20_ep16.py`, EP8 `--impl v2`): forced-balanced routing, one CUDA graph per call, 256 MiB written before every
 replay (cold L2), CUDA-event span of the replay, median of 30 replays per rank, max over the ranks. Inputs are
-already in the symmetric buffer (no frontend, no input quantisation in the span). EP8: the one fused kernel, NVLink
-only, clocks locked at 1830 MHz. EP16: `--transport gin`, the one fused kernel per node with the cross-node exchange
+already quantised (FP8 rows + K128 scales, top-k ids / weights) in device tensors (fused: in the symmetric buffer); no
+frontend, no input quantisation in the span. EP8: the one v2 kernel launch, NVLink P2P (cudaIpc) only, clocks locked
+at 1830 MHz. EP16: `--transport gin`, the one fused kernel per node with the cross-node exchange
 inside it (NCCL GIN, GDAKI backend, rail peer = same local rank on the other node); its clocks were not locked on
 every host. EP16 rows below 1 token per rank: half of the ranks have 1 row, the others 0. Push dispatch is not
 implemented over GIN, so every EP16 point uses the pull dispatch. MBU = weight bytes of the experts hit (FP4 payload +
 scales as stored) / (ranks × 4.0 TB/s × time).
 
 Correctness: every point above, 2 seeds each, against the exact-quantised reference (FP8 activations, dequantised
-weights, quantised intermediate): cos_min >= 0.99994 (EP16 M56), all others >= 0.99996; norm ratio 0.9999-1.0000.
+weights, quantised intermediate): cos_min >= 0.99993; norm ratio 0.9997-1.0000.
 
 ```bash
 # EP8 (one host)
-torchrun --standalone --nproc-per-node 8 tests/test_h20_ep16.py --mode ep8 --quant mxfp4 \
+torchrun --standalone --nproc-per-node 8 tests/test_h20_ep16.py --mode ep8 --quant mxfp4 --impl v2 \
   --hidden 4096 --intermediate 1536 --experts 640 --topk 8 --global-tokens 64
 # EP16 (two hosts, node rank 0 / 1)
 torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 8 --master-addr <node0> --master-port 29655 \

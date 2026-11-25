@@ -153,6 +153,8 @@ def main():
     p.add_argument("--mode", choices=["ep8", "ep16"], required=True)
     p.add_argument("--quant", choices=["mxfp4", "qoq"], default="mxfp4")
     p.add_argument("--tokens", type=int, default=8, help="tokens per rank")
+    p.add_argument("--impl", choices=("fused", "v2"), default="fused",
+                   help="EP8 kernel: fused (one CTA per SM) or v2 (deep_gemm/mega/h20_v2.py, SM120 dataflow)")
     p.add_argument("--global-tokens", type=int, default=0,
                    help="global M (all ranks): rank r gets M(r+1)/world - Mr/world real rows, buffers sized for the "
                         "largest share, the rest padding rows with no experts (overrides --tokens)")
@@ -263,6 +265,16 @@ def main():
         else:
             def node_kernel_only(y, xq, xs):
                 kernel(ep.y_node, *weights, ep.buffer, activation_clamp=args.activation_clamp)
+    elif args.impl == "v2":
+        from deep_gemm.mega.h20_v2 import H20V2Buffer, mxfp4_mega_moe_h20_v2
+        assert not qoq, "v2: MXFP4 only"
+        v2_buffer = H20V2Buffer(node_group, args.experts, t, topk, H, I)
+
+        def forward(y, xq, xs):
+            mxfp4_mega_moe_h20_v2(y, xq, xs, topk_idx, topk_w, *weights, v2_buffer,
+                                  activation_clamp=args.activation_clamp)
+
+        node_kernel_only = forward
     else:
         buffer = deep_gemm.get_fused_symm_buffer_for_mega_moe(node_group, args.experts, t, topk, H, I)
 
@@ -391,6 +403,34 @@ def main():
             stamp_phases(lambda st: ep.run(y, None, None, weights, activation_clamp=args.activation_clamp,
                                            phase_stamps=st),
                          list(STAMP_SLOTS), flush, align, rank, world)
+        elif args.stamps and args.impl == "v2":
+            # v2 kernel stamps (thread 0 of every CTA, globaltimer ns; see sm90_fp4_mega_moe_h20_v2.cu)
+            grid = v2_buffer.ext.grid_sizes()[0]
+            st = torch.zeros(grid * 16, dtype=torch.int64, device="cuda")
+            meds = []
+            for _ in range(10):
+                flush.zero_()
+                st.zero_()
+                dist.all_reduce(align)
+                torch.cuda.synchronize()
+                mxfp4_mega_moe_h20_v2(y, xq, xs, topk_idx, topk_w, *weights, v2_buffer,
+                                      activation_clamp=args.activation_clamp, stamps=st)
+                torch.cuda.synchronize()
+                v = st.view(grid, 16).double()
+                t0 = v[:, 0].min()
+                row = [(v[:, k] - t0).max() / 1e3 for k in (1, 10, 2, 12, 3, 4, 5)]
+                row += [v[:, k].mean() / 1e3 for k in (6, 8, 9, 11)] + [v[:, 7].mean(), (v[:, 13] - t0).min() / 1e3]
+                meds.append(torch.stack(row))
+            med = torch.stack(meds).median(dim=0).values
+            all_med = [None] * world
+            dist.all_gather_object(all_med, med.cpu().tolist())
+            if rank == 0:
+                names = ["dispatched (max)", "map (max)", "rows in (max)", "first item (max)", "work end (max)",
+                         "comb flags (max)", "kernel end (max)", "sum pre-GEMM / CTA", "sum GEMM wait kcyc / CTA",
+                         "sum GEMM / CTA", "sum epilogue / CTA", "items / CTA", "first CTA done (min)"]
+                print("V2STAMPS us after the earliest CTA start, median of 10; columns = ranks", flush=True)
+                for k, n in enumerate(names):
+                    print(f"V2STAMP {n:<22s} " + " ".join(f"{r[k]:7.1f}" for r in all_med), flush=True)
         elif args.stamps and args.mode == "ep8":
             stamp_phases(lambda st: kernel(y, *weights, buffer, activation_clamp=args.activation_clamp, phase_stamps=st),
                          [k for k in STAMP_SLOTS if k < 48], flush, align, rank, world, probe=args.stage_probe)
