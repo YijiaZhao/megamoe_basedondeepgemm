@@ -180,7 +180,8 @@ def bench(fmt, rank, world, group, ms, transport, stamps=False):
     """README shape (or BENCH_SHAPE) and method (the H20 / B200 tables' L2 flush): global M tokens over the
     ranks (one row per rank up to M = world), balanced routing with weight 1/top-k: copy s of global token g goes to
     rank s * world / top-k + g % (world / top-k) (rank s at EP8; (g * top-k + s) % world when top-k does not divide
-    the world), local expert (g + 7 s) % EL.
+    the world); each rank hands the copies it receives, in (g, s) order, to its local experts in turn, so every
+    expert gets the same number of tokens (± 1 where it does not divide).
     Cold L2: 256 MB written before each graph replay, ranks released by a barrier, median of 30 replays, median over
     3 passes."""
     h, i, e, topk = SHAPES[os.environ.get('BENCH_SHAPE', 'readme')]
@@ -207,11 +208,13 @@ def bench(fmt, rank, world, group, ms, transport, stamps=False):
     for m in ms:
         rows = max(1, m // world)
         ids = torch.full((rows, topk), -1, dtype=torch.int32)
-        for r in range(rows):
-            gi = rank * rows + r
-            if gi < m:
-                ids[r] = torch.tensor([dest(gi, s) * el + (gi + 7 * s) % el for s in range(topk)],
-                                      dtype=torch.int32)
+        arrived = [0] * world  # copies routed to each rank so far, in (g, s) order: its local experts in turn
+        for gi in range(m):
+            for s in range(topk):
+                d = dest(gi, s)
+                if gi // rows == rank:
+                    ids[gi % rows, s] = d * el + arrived[d] % el
+                arrived[d] += 1
         ids = ids.cuda()
         wts = torch.full((rows, topk), 1.0 / topk, device='cuda')
         x = (torch.randn(rows, h, device='cuda', generator=gen) * 0.1).bfloat16()
