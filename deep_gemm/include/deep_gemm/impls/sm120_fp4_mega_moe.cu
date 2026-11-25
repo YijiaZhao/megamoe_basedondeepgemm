@@ -1427,12 +1427,18 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
         if (kA8) {  // swept on 6000D EP8, cold L2, 1-64 tokens per rank: 8 while one sub-tile holds e, 16 beyond
             nt = e > 8.f ? 2 : 1;
         } else {
-            // W4A4, swept on 6000D EP8, cold L2, 128-1024 tokens per rank, 16 / 32 / 64 forced per shape (W4A4.md):
-            // experts of I >= 2048 gain from wide items early (fewer passes of the expert's weights through L2); the
-            // I 1280 shape is bound by the weight stream and keeps 16 up to e 48
-            if (e <= 8.f) nt = 1;
-            else if (a.I >= 2048) nt = e < 16.f ? 2 : e < 32.f ? 4 : 8;
-            else nt = e < 48.f ? 2 : 4;
+            // W4A4: an empirical default, not the optimum. Swept on 6000D (two CX8 hosts), cold L2, balanced routing,
+            // 8 / 16 / 32 / 64 forced at 1-1024 tokens per rank for four shapes (W4A4.md); re-sweep for another model,
+            // EP size, network or routing. Experts of I >= 2048 gain from wide items (fewer passes of the expert's
+            // weights through L2); the I 1280 shape is bound by the weight stream. Beyond 8 ranks most peers are NIC
+            // peers, whose FC2 partials leave only once a whole item's tile is done: wide items lengthen that tail
+            if (a.W <= 8) {
+                if (a.I >= 2048) nt = e <= 8.f ? 1 : e < 16.f ? 2 : e < 32.f ? 4 : 8;
+                else nt = e < 16.f ? 1 : e < 48.f ? 2 : 4;
+            } else {
+                if (a.I >= 2048) nt = e <= 8.f ? 1 : 8;
+                else nt = e < 16.f ? 1 : 2;
+            }
         }
     }
     TORCH_CHECK((nt == 1 || nt == 2 || nt == 4 || nt == 8) && (tile_tokens <= 0 || tile_tokens == nt * kTile),
