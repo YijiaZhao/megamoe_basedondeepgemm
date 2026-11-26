@@ -47,6 +47,41 @@ tokens per rank:
 * W4A8: faster at every point, except GLM-5.3-Flash at 128 tokens per rank (610.3 vs 535.8 µs).
 * NVFP4: faster at every point on GLM-5.3-Flash; slower on DeepSeek-V4.1-Flash at 6-64 tokens per rank (by 0.7-5.2 %).
 
+## Test hosts
+
+Two kinds of 8x RTX 6000D host, the same GPUs, CPUs (2x AMD EPYC 9575F), driver (580.95.05) and NICs (4x ConnectX-8),
+but a different PCIe fabric. The kernel moves tokens and partials over PCIe P2P stores (no NVLink), so the fabric
+decides which pairs can use P2P and the times on one host do not carry over to the other.
+
+| | R6KD-BRCM (10.6.142.20) | R6KD-CX8aaS (10.6.142.1, .3, .6) |
+|---|---|---|
+| GPU pairs 0-1, 2-3, 4-5, 6-7 behind | one Broadcom PEX890xx Gen5 switch each, with one ConnectX-8 | the PCIe switch inside one ConnectX-8 each |
+| `nvidia-smi topo -m`: pair / same socket / other socket | PIX / NODE / SYS | PXB / NODE / SYS |
+| NIC ports up | 4 x 400 Gb/s (one port per ConnectX-8) | 8 x 400 Gb/s (both ports) |
+| Transport this kernel is measured with | `'p2p'`: every pair over P2P | `'lsa_where_reachable'`: the 3 same-socket peers over P2P, the 4 others over the NIC |
+| Tables measured on it | [vs gc-moe](#vs-gc-moe) (first part); README's RTX 6000D rows | every other table here (EP8 on .1 / .6, EP16 on .1 + .6) |
+
+P2P write bandwidth with SM stores (16 B per thread, the way the kernel pushes rows), 64 MB per destination, GB/s (per
+source GPU), [`bench/p2pbw.cu`](../sm120_6000d/bench/p2pbw.cu) (`nvcc -O3 -gencode=arch=compute_120a,code=sm_120a
+p2pbw.cu -o p2pbw && ./p2pbw`):
+
+| Writes | R6KD-BRCM (.20) | R6KD-CX8aaS (.6) |
+|---|---:|---:|
+| GPU 0 -> 1 (same switch) | 51.1 | 51.0 |
+| GPU 0 -> 2 (same socket, other switch) | 51.1 | 51.1 |
+| GPU 0 -> 4 (other socket) | 47.1 | 46.5 |
+| GPU 0 -> 1, 2, 3 at once (same socket) | 51.2 | 51.1 |
+| GPU 0 -> 2, 3 at once (one other switch) | 51.1 | 51.1 |
+| GPU 0 -> 2, 4 at once (same socket and other socket) | 51.1 | **2.0** |
+| GPU 0 -> all 7 at once | 51.2 | **1.5** |
+| every GPU -> its 7 peers at once | 34.1 | **0.8** |
+| every GPU -> its 3 same-socket peers at once | 50.2 | 37.9 |
+
+On R6KD-CX8aaS any single path runs at full speed, but a GPU that writes to a GPU on the other socket and to one behind
+another root port at the same time drops to 1.5-2 GB/s; an all-to-all over every pair, which is what an EP layer
+does, gets 0.8 GB/s per GPU. Hence the transport table there: P2P only within a socket, the other socket over the NIC.
+On R6KD-BRCM every pair can go over P2P at once.
+
 ## Results (8x RTX 6000D, R6KD-CX8aaS hosts 10.6.142.1 / .6)
 
 ### Correctness

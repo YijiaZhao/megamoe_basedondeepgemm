@@ -177,8 +177,10 @@ Architecture diagram: [`docs/H20_FOUR_API_FUSED_ARCHITECTURE.html`](docs/H20_FOU
 
 ### SM120 test host (8x RTX 6000D)
 
-Every RTX 6000D number in this repository comes from this host. The kernel moves tokens and partials over PCIe P2P (no
+The host of the RTX 6000D rows above: R6KD-BRCM (10.6.142.20). The kernel moves tokens and partials over PCIe P2P (no
 NVLink), so its times depend on the PCIe fabric below; another 6000D host with a different fabric gives other times.
+The SM120 results document also uses R6KD-CX8aaS hosts, whose PCIe fabric only allows P2P within a socket; both
+fabrics side by side, with measured P2P bandwidth: [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md#test-hosts).
 
 | Item | Configuration |
 |---|---|
