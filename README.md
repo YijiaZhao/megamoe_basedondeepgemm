@@ -337,7 +337,7 @@ Per-platform result documents (one table + measurement method + reproduce each):
 | 8x B200 (SM100, 1965 MHz) | Upstream baseline: [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) main `78b6900` W-MXFP4xA-FP8 `fp8xfp4` MegaMoE, kernel unmodified | 47.2 / 50.5 / 53.2 / 61.2 | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x B200 (SM100, 1965 MHz) | **E2E** (frontend kernel + forced-balanced memcpy + MegaMoE, one CUDA graph): W-MXFP4xA-FP8 / W4A4 MXFP4 / W4A4 NVFP4 | 44.0 / 48.5 / 53.8 / 63.0 (FP8 act), 40.8 / 44.8 / 51.5 / 58.9 (MXFP4), 41.7 / 46.4 / 52.3 / 60.0 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x H20-3e (SM90, 1830 MHz) | **E2E** (same graph, padding rows unrouted): MXFP4 / QoQ fused | 44.6 / 54.0 / 62.2 / 80.9 (MXFP4), 44.8 / 54.2 / 60.4 / 80.6 (QoQ) | [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) |
-| 8x RTX 6000D (SM120, PCIe P2P, clocks not locked) | W4A8 / W4A4 MXFP4 / W4A4 NVFP4 `fp4_mega_moe_sm120` (CUDA events, cold L2) | 43.6 / 57.7 / 78.6 / 116.3 (W4A8), 43.8 / 57.2 / 78.4 / 115.0 (MXFP4), 46.8 / 60.8 / 81.3 / 120.8 (NVFP4) | [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md) |
+| 8x RTX 6000D (SM120, PCIe P2P, clocks not locked) | W4A8 / W4A4 MXFP4 / W4A4 NVFP4 `fp4_mega_moe_sm120` (CUDA events, cold L2) | 43.6 / 57.7 / 78.6 / 116.3 (W4A8), 43.8 / 57.2 / 78.4 / 115.0 (MXFP4), 46.8 / 60.8 / 81.3 / 120.8 (NVFP4) | [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md) |
 
 Same model scale for all rows (E384 / 48 local, H3072, I1280, top-8, EP8) and the same forced-balanced routing; every column is the
 kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200;
@@ -377,9 +377,10 @@ Method and correctness: [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.m
 
 SM120 (8x RTX 6000D, PCIe P2P, no NVLink; host: [SM120 test host](#sm120-test-host-8x-rtx-6000d)): `fp4_mega_moe_sm120`,
 one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4, over PCIe P2P or, for peers on
-another host, the NIC (NCCL GIN), up to 16 ranks. This README's shape, EP8, cold L2
+another host, the NIC (NCCL GIN), up to 16 ranks. **Use it for decode-size batches: fewer than 256 tokens per rank and
+at most 128 tokens per local expert**; above that, use a grouped-GEMM MoE. This README's shape, EP8, cold L2
 (256 MB written before each replay), W4A8: 43.6 / 57.7 / 78.6 / 116.3 µs at M2 / 4 / 8 / 16; all formats, method and
-correctness: [sm120_6000d/W4A4.md](sm120_6000d/W4A4.md); environment variables: [sm120_6000d/ENV.md](sm120_6000d/ENV.md).
+correctness: [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md); environment variables: [sm120_6000d/ENV.md](sm120_6000d/ENV.md).
 
 ## Relevant source files
 

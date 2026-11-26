@@ -1,5 +1,5 @@
 """gc-moe (github.com/Bruce-Lee-LY/gc-moe, SM120 `sm120_fp8_fp4_gc_moe`) vs this repo's SM120 MegaMoE: same weights,
-same routing, same timing. Used for the "vs gc-moe" tables of sm120_6000d/W4A4.md.
+same routing, same timing. Used for the "vs gc-moe" tables of docs/SM120_MEGAMOE_RESULTS.md.
 
 GC_ROOT=<gc-moe checkout> MM_ROOT=<this repo> OURS_FMT=w4a8|mxfp4|nvfp4 \
 torchrun --nproc_per_node=4 gc_moe_compare.py --impl gc|ours --shape glm53flash|dsv41|dsv4flash|readme \

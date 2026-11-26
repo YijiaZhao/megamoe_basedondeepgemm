@@ -1,7 +1,7 @@
 # SM120 MegaMoE（`fp4_mega_moe_sm120`）设计说明
 
 读者：要改这个 kernel 的人或 agent。先读第 1–3 节，改代码前读第 5 节（不变量）。
-性能表、测法、正确性见 [W4A4.md](W4A4.md)；测试机拓扑见 README 的
+性能表、测法、正确性见 [docs/SM120_MEGAMOE_RESULTS.md](../docs/SM120_MEGAMOE_RESULTS.md)；测试机拓扑见 README 的
 [SM120 test host](../README.md#sm120-test-host-8x-rtx-6000d)；环境变量见 [ENV.md](ENV.md)。
 
 ## 1. 一句话
@@ -195,8 +195,8 @@ grid = 每 SM 两个 CTA × SM 数（6000D：312 个 CTA）。每个 CTA 256 线
 |---|---|
 | 发往同一 rank 的多个专家副本没有去重（P2P 和网卡都是） | 随机路由下 README 形状约 34% 的发送是重复的。bench 的均衡路由每个 token 的 8 个专家正好分在 8 个 rank，测不出这个问题。改法：每 rank 发一份 + 接收方副本索引表，需要改 pool 布局和 FC1 读行 |
 | RTX PRO 6000 主机（smc521ge-0049，双路 Xeon 8480+）M256 起比 .20 慢 6–26× | 单对 NCCL 带宽正常（44–47 GB/s），P2P 全通。推测是“一张卡的很多 SM 同时写多个远端”时带宽塌，未验证 |
-| CX8 主机（.1/.3/.6）上跨根端口的 P2P all-to-all 塌到每卡约 0.7 GB/s | 用传输表绕开：8 个网卡都给 NCCL 时它只映射同插槽的对，`'lsa_where_reachable'` 即“同插槽 P2P、跨插槽网卡”。`'auto'` 的 probe 只搬数据，在 .3 上两张表差 1%，按 3% 规则选了 `all_gin`，而 kernel 实测 `lsa_where_reachable` 每个 M 都更快（W4A4.md） |
-| 跨机只测过 EP16 两台 CX8 主机（.3 + .1） | 三种格式正确性通过，性能见 W4A4.md；Broadcom 主机（.20 类）之间、以及 auto 选表在跨机下的取舍没有测 |
+| CX8 主机（.1/.3/.6）上跨根端口的 P2P all-to-all 塌到每卡约 0.7 GB/s | 用传输表绕开：8 个网卡都给 NCCL 时它只映射同插槽的对，`'lsa_where_reachable'` 即“同插槽 P2P、跨插槽网卡”。`'auto'` 的 probe 只搬数据，在 .3 上两张表差 1%，按 3% 规则选了 `all_gin`，而 kernel 实测 `lsa_where_reachable` 每个 M 都更快（docs/SM120_MEGAMOE_RESULTS.md） |
+| 跨机只测过 EP16 两台 CX8 主机（.3 + .1） | 三种格式正确性通过，性能见 docs/SM120_MEGAMOE_RESULTS.md；Broadcom 主机（.20 类）之间、以及 auto 选表在跨机下的取舍没有测 |
 
 试过、实测没有收益、已从代码删除的做法（不要重复尝试，除非条件变了）：
 

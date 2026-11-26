@@ -23,7 +23,7 @@ other (on .20 they sit on different subnets, and the NCCL window registration fa
 On RoCE, set `NCCL_IB_TC` to the fabric's lossless traffic class (on the CX8 hosts `96`, see the table below): the NIC
 transport's queue pairs use it, not the port's global traffic class.
 
-## Two-host EP16 on the CX8 hosts: the network setup the W4A4.md EP16 numbers were measured with
+## Two-host EP16 on the CX8 hosts: the network setup the EP16 numbers of [SM120_MEGAMOE_RESULTS.md](../docs/SM120_MEGAMOE_RESULTS.md) were measured with
 
 Launcher: [`bench/run_ep16.sh`](bench/run_ep16.sh), started on both hosts at once. The transport section's EP16 numbers:
 .3 + .1, node rank 0 on .3 (`MASTER=10.6.142.3`, port 29651; checked again 2026-11-12 with `NCCL_DEBUG=INFO`, MXFP4
@@ -52,6 +52,6 @@ the same setup plus `NCCL_IB_TC=96`; the QoS rows below checked on both (`mlnx_q
 | 4 | `mlx5_4`, `mlx5_5` (`enp243s0f0np0`, `enp243s0f1np1`) | f3:00 | GPU 6-7 | 1 |
 
 Other NIC settings change the numbers: with one NIC (`NCCL_IB_HCA==mlx5_0`) or two (`=mlx5_0,mlx5_4`) NCCL maps every
-pair for P2P, but every rank then shares those NICs (single host: W4A4.md). Before a run: all 16 GPUs idle, every
+pair for P2P, but every rank then shares those NICs (single host: [SM120_MEGAMOE_RESULTS.md](../docs/SM120_MEGAMOE_RESULTS.md)). Before a run: all 16 GPUs idle, every
 port `ACTIVE` (`ibdev2netdev`, `cat /sys/class/infiniband/mlx5_*/ports/1/state`), and the other host's 172.16 address
 of each port answering a ping from that port (`ping -I <netdev>`).

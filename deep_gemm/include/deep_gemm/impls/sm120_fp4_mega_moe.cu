@@ -1428,9 +1428,9 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     if (tile_tokens <= 0) {
         const float e = float(a.T) * a.TOPK / a.EL;
         if (kA8) {
-            // W4A8: an empirical default, not the optimum (as W4A4 below; W4A8 sweeps in W4A4.md). At EP8 the
-            // I >= 2048 shapes take W4A4's widths, the I 1280 shape 64 from e 48 (32 is not faster than 16 there); at
-            // EP16 16-token items hold out longer than W4A4's (the FP8 rows are twice the bytes per token)
+            // W4A8: an empirical default, not the optimum (as W4A4 below; docs/SM120_MEGAMOE_RESULTS.md). At EP8
+            // the I >= 2048 shapes take W4A4's widths, the I 1280 shape 64 from e 48 (32 is not faster than 16
+            // there); at EP16 16-token items hold out longer than W4A4's (the FP8 rows are twice the bytes per token)
             if (a.W <= 8) {
                 if (a.I >= 2048) nt = e <= 8.f ? 1 : e < 16.f ? 2 : e < 32.f ? 4 : 8;
                 else nt = e < 16.f ? 1 : e < 48.f ? 2 : 8;
@@ -1440,10 +1440,11 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
             }
         } else {
             // W4A4: an empirical default, not the optimum. Swept on 6000D (two CX8 hosts), cold L2, balanced routing,
-            // 8 / 16 / 32 / 64 forced at 1-1024 tokens per rank for four shapes (W4A4.md); re-sweep for another model,
-            // EP size, network or routing. Experts of I >= 2048 gain from wide items (fewer passes of the expert's
-            // weights through L2); the I 1280 shape is bound by the weight stream. Beyond 8 ranks most peers are NIC
-            // peers, whose FC2 partials leave only once a whole item's tile is done: wide items lengthen that tail
+            // 8 / 16 / 32 / 64 forced at 1-1024 tokens per rank for four shapes (docs/SM120_MEGAMOE_RESULTS.md);
+            // re-sweep for another model, EP size, network or routing. Experts of I >= 2048 gain from wide items
+            // (fewer passes of the expert's weights through L2); the I 1280 shape is bound by the weight stream.
+            // Beyond 8 ranks most peers are NIC peers, whose FC2 partials leave only once a whole item's tile is
+            // done: wide items lengthen that tail
             if (a.W <= 8) {
                 if (a.I >= 2048) nt = e <= 8.f ? 1 : e < 16.f ? 2 : e < 32.f ? 4 : 8;
                 else nt = e < 16.f ? 1 : e < 48.f ? 2 : 4;
