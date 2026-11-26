@@ -154,7 +154,7 @@ def main():
     p.add_argument("--quant", choices=["mxfp4", "qoq"], default="mxfp4")
     p.add_argument("--tokens", type=int, default=8, help="tokens per rank")
     p.add_argument("--impl", choices=("fused", "v2"), default="fused",
-                   help="EP8 kernel: fused (one CTA per SM) or v2 (deep_gemm/mega/h20_v2.py, SM120 dataflow)")
+                   help="kernel: fused (one CTA per SM) or v2 (deep_gemm/mega/h20_v2.py, SM120 dataflow; EP16 over NCCL GIN)")
     p.add_argument("--global-tokens", type=int, default=0,
                    help="global M (all ranks): rank r gets M(r+1)/world - Mr/world real rows, buffers sized for the "
                         "largest share, the rest padding rows with no experts (overrides --tokens)")
@@ -229,10 +229,21 @@ def main():
     expert_bytes = sum(w[0].numel() * w[0].element_size() for w in weights) / local_experts
     hit_bytes_total = hit.numel() * expert_bytes
     del idx_seen
-    if args.mode == "ep16":
+    gin = args.transport == "gin"
+    if args.mode == "ep16" and args.impl == "v2":
+        from deep_gemm.mega.h20_v2 import H20V2EP16, mxfp4_mega_moe_h20_v2
+        assert not qoq, "v2: MXFP4 only"
+        ep = H20V2EP16(world_group, node_group, args.experts, t, topk, H, I)
+        v2_buffer = ep.buffer
+
+        def forward(y, xq, xs):
+            mxfp4_mega_moe_h20_v2(y, xq, xs, topk_idx, topk_w, *weights, v2_buffer,
+                                  activation_clamp=args.activation_clamp)
+
+        node_kernel_only = forward
+    elif args.mode == "ep16":
         ep = H20EP16(world_group, node_group, args.experts, t, topk, H, I, quant=args.quant, overlap=args.overlap,
                      transport=args.transport)
-        gin = args.transport == "gin"
 
         def forward(y, xq, xs):
             ep(y, xq, xs, topk_idx, topk_w, weights, activation_clamp=args.activation_clamp)
@@ -388,7 +399,7 @@ def main():
             del g
 
         forward(y, xq, xs)          # fills the buffer inputs (EP8: the kernel-only graph reads them)
-        if args.mode == "ep16":
+        if args.mode == "ep16" and args.impl != "v2":
             if gin:
                 bench(ep16_run, "full gin (one fused kernel, cross-node exchange inside)")
             else:
@@ -399,7 +410,7 @@ def main():
                     bench(fn, label)
         if node_kernel_only is not None:
             bench(node_kernel_only, "kernel only")
-        if args.stamps and args.mode == "ep16" and gin:
+        if args.stamps and args.mode == "ep16" and gin and args.impl != "v2":
             stamp_phases(lambda st: ep.run(y, None, None, weights, activation_clamp=args.activation_clamp,
                                            phase_stamps=st),
                          list(STAMP_SLOTS), flush, align, rank, world)
@@ -419,7 +430,12 @@ def main():
                 v = st.view(grid, 16).double()
                 t0 = v[:, 0].min()
                 row = [(v[:, k] - t0).max() / 1e3 for k in (1, 10, 2, 12, 3, 4, 5)]
-                row += [v[:, k].mean() / 1e3 for k in (6, 8, 9, 11)] + [v[:, 7].mean(), (v[:, 13] - t0).min() / 1e3]
+                row += [v[:, k].mean() / 1e3 for k in (6, 8, 9, 11)] + [v[:, 7].mean()]
+                if args.mode == "ep16":  # 13: own-row signal wait (ns, summed per CTA), 14: peer rows in, 15: last put
+                    put = v[:, 15]
+                    row += [v[:, 13].max() / 1e3, (v[:, 14] - t0).max() / 1e3, (put[put > 0] - t0).max() / 1e3]
+                else:
+                    row += [(v[:, 13] - t0).min() / 1e3]
                 meds.append(torch.stack(row))
             med = torch.stack(meds).median(dim=0).values
             all_med = [None] * world
@@ -427,7 +443,9 @@ def main():
             if rank == 0:
                 names = ["dispatched (max)", "map (max)", "rows in (max)", "first item (max)", "work end (max)",
                          "comb flags (max)", "kernel end (max)", "sum pre-GEMM / CTA", "sum GEMM wait kcyc / CTA",
-                         "sum GEMM / CTA", "sum epilogue / CTA", "items / CTA", "first CTA done (min)"]
+                         "sum GEMM / CTA", "sum epilogue / CTA", "items / CTA"] + (
+                    ["own-row wait sum (max CTA)", "peer rows in (max)", "last y put (max)"] if args.mode == "ep16"
+                    else ["first CTA done (min)"])
                 print("V2STAMPS us after the earliest CTA start, median of 10; columns = ranks", flush=True)
                 for k, n in enumerate(names):
                     print(f"V2STAMP {n:<22s} " + " ".join(f"{r[k]:7.1f}" for r in all_med), flush=True)

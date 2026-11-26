@@ -17,6 +17,12 @@
  * swizzle = the wgmma B operand; the rows are first compacted per expert); warpgroup w
  * decodes rows 128w..128w+127 (two m64 tiles) and runs RS wgmma m64n8k32 per K128 block. 16-row block
  * b = 8w + 4j + (warp % 4) of m64 tile j: L1 output columns 8b..8b+7 (the item's 128 = one FC2 input scale group).
+ *
+ * Two-node EP16 (H20V2_GIN=1, NCCL Device API; window layout of layout/h20_ep16_gin.cuh): every rank first puts its T
+ * own rows (FP8 x, K128 scales, global top-k ids / weights) to its rail peer (same local GPU of the other node) with
+ * one GIN put; the launch then runs over 2T rows (own [0, T), the peer's [T, 2T) read from the NIC receive region)
+ * with every top-k id mapped to this node's experts (-1 when on the other node). The combine puts each peer row's
+ * partial sum back (signal 1 + row) and adds the peer's partial of each own row before writing y.
  */
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -30,7 +36,19 @@
 #include <cstring>
 #include <vector>
 
+#include <deep_gemm/layout/h20_ep16_gin.cuh>
 #include <deep_gemm/quantization/fp4_fused_dequant.cuh>
+
+#ifndef H20V2_GIN
+#define H20V2_GIN 0
+#endif
+// GIN code is device-pass only: NCCL's device headers do not compile in nvcc's host pass
+#if H20V2_GIN && defined(__CUDA_ARCH__)
+#define H20V2_GIN_DEVICE 1
+#include <nccl_device.h>
+#else
+#define H20V2_GIN_DEVICE 0
+#endif
 
 #define CHECK_CUDA(x)                                                                      \
     do {                                                                                   \
@@ -65,7 +83,7 @@ constexpr int kMaxNt = 1;
 constexpr int kMaxT = kTile * kMaxNt;
 constexpr int kMaxWorld = 16;
 constexpr int kMaxEl = 128;
-constexpr int kMaxKb = 32;  // K <= 4096
+constexpr int kMaxKb = 64;  // K <= 8192
 constexpr int kTopkMax = 8;
 constexpr uint64_t kSpinNs = 30000000000ull;
 
@@ -75,7 +93,8 @@ constexpr int kCtrCompact = 6;  // CTAs done compacting the pool rows
 constexpr int kCtrFlag = 8, kCtrL1 = 16;
 constexpr int kMaxTiles = 2048;               // expert tiles of 8 tokens per call
 constexpr int kCtrTileX = kCtrL1 + kMaxEl;     // [tile]: epoch once the tile's rows are compacted (never reset)
-constexpr int kCtrInts = kCtrTileX + kMaxTiles;
+constexpr int kCtrRowDone = kCtrTileX + kMaxTiles;  // EP16 [peer row]: combine chunks summed (self-resetting)
+constexpr int kCtrInts = kCtrRowDone + 256;
 
 // a pool row: H E4M3 values, H/128 fp32 scales, then 16 bytes: int source token*8 + k, float top-k weight
 __host__ __device__ __forceinline__ int pool_rx(int H) { return H + H / 32 + 16; }
@@ -106,6 +125,8 @@ struct Args {
     unsigned long long *stamps;
     Peers peers;
     int T, H, I, EL, W, TOPK, TCAP, rank;
+    int Town;                  // EP16: own rows (T = 2 Town: own + the rail peer's); EP8: T
+    deep_gemm::H20Ep16Gin gin; // EP16 NIC window (H20V2_GIN)
     float clamp;
 };
 
@@ -359,6 +380,7 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
     const int H = a.H, I = a.I, EL = a.EL, W = a.W, TOPK = a.TOPK, TCAP = a.TCAP;
     __shared__ Map m;
     __shared__ int s_item, s_ok, s_epoch;
+    __shared__ unsigned long long s_put_t, s_wait_ns;  // EP16 stamps: last combine put issued, own-row wait sum
     __shared__ uint2 s_lut[128];
     __shared__ uint64_t s_full[kStages], s_empty[kStages];
     __shared__ uint64_t s_mfull[2], s_mempty[2];  // item mailbox: producer -> math warps
@@ -372,12 +394,14 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
     extern __shared__ __align__(1024) uint8_t ring[];
 
     // stamps (thread 0, globaltimer ns): 0 start 1 dispatched 10 map 2 rows in 3 work end 4 combine flags 5 end;
-    // per-CTA sums: 6 FC1 wait 8 B tile 9 GEMM 11 epilogue; 7 items, 12 first item, 13 last item end
+    // per-CTA sums: 6 FC1 wait 8 B tile 9 GEMM 11 epilogue; 7 items, 12 first item, 13 last item end;
+    // EP16: 14 the peer's rows in, 15 the last combine put issued (0: none), 13 the own-row signal wait sum (ns)
     unsigned long long st_[16] = {gtime()};
     if (threadIdx.x < 128) s_lut[threadIdx.x] = deep_gemm::nvfp4::kE2M1AndE8M0RelToFp8Lut[threadIdx.x];
     if (threadIdx.x == 0) {
         s_epoch = *reinterpret_cast<volatile int *>(a.ctr + kCtrEpoch) + 1;
         s_ok = 1;
+        s_put_t = s_wait_ns = 0;
         for (int d = 0; d < kStages; ++d) bar_init(s_full + d, 1), bar_init(s_empty + d, kWarps);
         for (int q = 0; q < 2; ++q) bar_init(s_mfull + q, 1), bar_init(s_mempty + q, kWarps);
         for (int q = 0; q < 2; ++q) bar_init(s_efull + q, 1), bar_init(s_eempty + q, 1);
@@ -388,13 +412,98 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
     const int epoch = s_epoch;
     int *ctr = a.ctr;
 
+    // ---------------- EP16: the own rows to the rail peer (one put), then wait for the peer's
+    const int RB = H + H / 32 + TOPK * 12;  // NIC row: x, K128 scales, top-k ids (int64), weights
+    const uint64_t in_send = 0, in_recv = uint64_t(a.gin.max_own) * RB;
+    const uint64_t y_send = 2ull * a.gin.max_own * RB, y_recv = y_send + uint64_t(a.gin.max_own) * H * 2;
+    const uint64_t epoch_off = y_recv + uint64_t(a.gin.max_own) * H * 2;  // + 4: send counter
+#if H20V2_GIN_DEVICE
+    const auto gin_put = [&](uint64_t dst, uint64_t src, uint64_t bytes, uint32_t sig) {
+        const ncclDevComm &c = *static_cast<const ncclDevComm *>(a.gin.comm);
+        const ncclWindow_t win = static_cast<ncclWindow_t>(a.gin.win);
+        ncclGin(c, int(sig % a.gin.num_contexts))
+            .put(ncclTeamWorld(c), int(1u - a.gin.node), win, dst, win, src, bytes, ncclGin_SignalInc{ncclGinSignal_t(sig)});
+    };
+    const auto gin_wait = [&](uint32_t sig) -> bool {
+        const ncclDevComm &c = *static_cast<const ncclDevComm *>(a.gin.comm);
+        const uint64_t t0 = gtime();
+        while (ncclGin(c, int(sig % a.gin.num_contexts)).readSignal(ncclGinSignal_t(sig)) < uint64_t(epoch))
+            if (gtime() - t0 > kSpinNs) return false;
+        return true;
+    };
+    {
+        const int nx = a.Town * (H / 16), nsf = a.Town * (H / 128), nk = a.Town * TOPK;
+        const int nitems = nx + nsf + 2 * nk, gthreads = int(gridDim.x * blockDim.x);
+        const int gtid = int(blockIdx.x * blockDim.x + threadIdx.x);
+        const int nwarps = (min(nitems, gthreads) + 31) / 32;
+        if (gtid / 32 < nwarps) {
+            for (int i = gtid; i < nitems; i += gthreads) {
+                if (i < nx) {
+                    const int t = i / (H / 16), q = i % (H / 16);
+                    reinterpret_cast<uint4 *>(a.gin.base + in_send + uint64_t(t) * RB)[q] = __ldg(reinterpret_cast<const uint4 *>(a.x + size_t(t) * H) + q);
+                } else if (i < nx + nsf) {
+                    const int j = i - nx, t = j / (H / 128), q = j % (H / 128);
+                    reinterpret_cast<float *>(a.gin.base + in_send + uint64_t(t) * RB + H)[q] = __ldg(a.x_sf + j);
+                } else if (i < nx + nsf + nk) {
+                    const int j = i - nx - nsf, t = j / TOPK;
+                    reinterpret_cast<long long *>(a.gin.base + in_send + uint64_t(t) * RB + H + H / 32)[j % TOPK] =
+                        __ldg(reinterpret_cast<const long long *>(a.topk_ids) + j);
+                } else {
+                    const int j = i - nx - nsf - nk, t = j / TOPK;
+                    reinterpret_cast<float *>(a.gin.base + in_send + uint64_t(t) * RB + H + H / 32 + TOPK * 8)[j % TOPK] = __ldg(a.topk_w + j);
+                }
+            }
+            __syncwarp();
+            if (lane == 0) {
+                __threadfence_system();
+                auto *counter = reinterpret_cast<unsigned *>(a.gin.base + epoch_off + 4);
+                if (atomicAdd(counter, 1u) + 1u == unsigned(nwarps)) {
+                    *counter = 0u;
+                    __threadfence_system();
+                    gin_put(in_recv, in_send, uint64_t(a.Town) * RB, 0);
+                }
+            }
+            __syncwarp();
+        }
+        if (threadIdx.x == 0 && !gin_wait(0)) {  // timed out: recorded; the later waits time out as well
+            atomicExch(ctr + kCtrErr, kErrDispatchWait);
+            s_ok = 0;
+        }
+        __syncthreads();
+        st_[14] = gtime();
+    }
+#endif
+    // token t (< Town: own, else the rail peer's row t - Town): rows, scales, node-local expert ids, weights
+    const uint8_t *peer_rows = a.gin.base + in_recv;
+    const auto tok_x = [&](int t) -> const uint8_t * {
+        return (H20V2_GIN && t >= a.Town) ? peer_rows + size_t(t - a.Town) * RB : a.x + size_t(t) * H;
+    };
+    const auto tok_sf = [&](int t) -> const float * {
+        return (H20V2_GIN && t >= a.Town) ? reinterpret_cast<const float *>(peer_rows + size_t(t - a.Town) * RB + H)
+                                          : a.x_sf + size_t(t) * (H / 128);
+    };
+    const auto tok_e = [&](int u) -> int {
+        if (!H20V2_GIN) return int(a.topk_ids[u]);
+        const int t = u / TOPK;
+        const long long e = t < a.Town ? a.topk_ids[u]
+                                       : __ldcv(reinterpret_cast<const long long *>(peer_rows + size_t(t - a.Town) * RB + H + H / 32) + u % TOPK);
+        const long long first = (long long)a.gin.node * EL * W;
+        return (e >= first && e < first + EL * W) ? int(e - first) : -1;
+    };
+    const auto tok_w = [&](int u) -> float {
+        const int t = u / TOPK;
+        return (H20V2_GIN && t >= a.Town)
+                   ? __ldcv(reinterpret_cast<const float *>(peer_rows + size_t(t - a.Town) * RB + H + H / 32 + TOPK * 8) + u % TOPK)
+                   : a.topk_w[u];
+    };
+
     // ---------------- routing counts first (tiny): every rank learns its experts' load before the rows land
     const int ndisp = min(a.T + 1, int(gridDim.x));
     if (blockIdx.x == ndisp - 1) {
         for (int u = threadIdx.x; u < W * EL; u += blockDim.x) m.cnt[u / EL][u % EL] = 0;
         __syncthreads();
         for (int u = threadIdx.x; u < a.T * TOPK; u += blockDim.x) {
-            const int e = int(a.topk_ids[u]);
+            const int e = tok_e(u);
             if (e >= 0) atomicAdd(&m.cnt[e / EL][e % EL], 1);
         }
         __syncthreads();
@@ -414,9 +523,9 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
         const int RX = pool_rx(H), nq = RX / 16 - 1;  // data + scales; the last 16 B: meta
         for (int t = blockIdx.x; t < a.T; t += gridDim.x) {
             if (warp < TOPK) {
-                const int e = int(a.topk_ids[t * TOPK + warp]);
+                const int e = tok_e(t * TOPK + warp);
                 int slot = 0;
-                for (int u = lane; u < t * TOPK; u += 32) slot += (int(a.topk_ids[u]) == e);
+                for (int u = lane; u < t * TOPK; u += 32) slot += (tok_e(u) == e);
 #pragma unroll
                 for (int o = 16; o; o >>= 1) slot += __shfl_xor_sync(0xffffffffu, slot, o);
                 if (lane == 0) {
@@ -427,14 +536,14 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
                         const int row = (el * W + a.rank) * TCAP + slot;
                         s_rowk[warp] = row, s_dstk[warp] = dst;
                         uint8_t *rec = a.peers.pool[dst] + size_t(row) * RX;
-                        const float wk = a.topk_w[t * TOPK + warp];
+                        const float wk = tok_w(t * TOPK + warp);
                         *reinterpret_cast<int4 *>(rec + RX - 16) = make_int4(t * 8 + warp, __float_as_int(wk), 0, 0);
                     }
                 }
             }
             __syncthreads();
-            const uint4 *xs4 = reinterpret_cast<const uint4 *>(a.x + size_t(t) * H);
-            const uint4 *ss4 = reinterpret_cast<const uint4 *>(a.x_sf + size_t(t) * (H / 128));
+            const uint4 *xs4 = reinterpret_cast<const uint4 *>(tok_x(t));
+            const uint4 *ss4 = reinterpret_cast<const uint4 *>(tok_sf(t));
             for (int q = threadIdx.x; q < nq; q += blockDim.x) {
                 const uint4 v = q < H / 16 ? __ldg(xs4 + q) : __ldg(ss4 + q - H / 16);
 #pragma unroll
@@ -750,6 +859,76 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
     }
     __syncthreads();
     st_[4] = gtime();
+#if H20V2_GIN_DEVICE
+    if (s_ok) {
+        // warp per (row, 256-column chunk), the peer's rows first: sum -> y_send, the row's last chunk puts the row back
+        // to the peer (signal 1 + row); then the own rows: sum + the peer's partial (after its signal) -> y
+        const __nv_bfloat16 *comb = a.peers.comb[a.rank];
+        const int nch = H / 256;
+        const int gw = int(blockIdx.x * (blockDim.x / 32) + warp), nw = int(gridDim.x * (blockDim.x / 32));
+        for (int unit = gw; unit < a.T * nch; unit += nw) {
+            const int r = unit / nch, h8 = (unit % nch) * 256 + lane * 8;
+            const int t = r < a.Town ? a.Town + r : r - a.Town;
+            const bool peer = t >= a.Town;
+            // the row's slots on this node (a peer row's ids sit in the NIC receive region)
+            const unsigned kmask = __ballot_sync(0xffffffffu, lane < TOPK && tok_e(t * TOPK + lane) >= 0);
+            uint4 v[kTopkMax];
+#pragma unroll
+            for (int k = 0; k < kTopkMax; ++k)
+                if (kmask >> k & 1u) v[k] = *reinterpret_cast<const uint4 *>(comb + (size_t(t) * TOPK + k) * H + h8);
+            float s[8] = {};
+#pragma unroll
+            for (int k = 0; k < kTopkMax; ++k) {
+                if (!(kmask >> k & 1u)) continue;
+                const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&v[k]);
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float2 f = __bfloat1622float2(b2[q]);
+                    s[2 * q] += f.x, s[2 * q + 1] += f.y;
+                }
+            }
+            if (!peer) {  // + the peer's partial of this own row
+                if (lane == 0) {
+                    const unsigned long long w0 = gtime();
+                    if (!gin_wait(1 + t)) atomicExch(ctr + kCtrErr, kErrCombineWait);
+                    atomicAdd(&s_wait_ns, gtime() - w0);
+                }
+                __syncwarp();
+                const uint4 u = __ldcv(reinterpret_cast<const uint4 *>(a.gin.base + y_recv + (size_t(t) * H + h8) * 2));
+                const __nv_bfloat162 *b2 = reinterpret_cast<const __nv_bfloat162 *>(&u);
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float2 f = __bfloat1622float2(b2[q]);
+                    s[2 * q] += f.x, s[2 * q + 1] += f.y;
+                }
+            }
+            uint32_t pk[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const __nv_bfloat162 b2 = __floats2bfloat162_rn(s[2 * q], s[2 * q + 1]);
+                pk[q] = *reinterpret_cast<const uint32_t *>(&b2);
+            }
+            uint4 *dst = peer ? reinterpret_cast<uint4 *>(a.gin.base + y_send + (size_t(t - a.Town) * H + h8) * 2)
+                              : reinterpret_cast<uint4 *>(a.out + size_t(t) * H + h8);
+            *dst = make_uint4(pk[0], pk[1], pk[2], pk[3]);
+            if (peer) {
+                __syncwarp();
+                if (lane == 0) {
+                    __threadfence_system();
+                    int *done = ctr + kCtrRowDone + (t - a.Town);
+                    if (atomicAdd(done, 1) == nch - 1) {
+                        *done = 0;
+                        __threadfence_system();
+                        const uint64_t off = uint64_t(t - a.Town) * H * 2;
+                        gin_put(y_recv + off, y_send + off, uint64_t(H) * 2, 1 + (t - a.Town));
+                        atomicMax(&s_put_t, gtime());
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+#else
     if (s_ok) {
         const __nv_bfloat16 *comb = a.peers.comb[a.rank];
         const int nvec = a.T * H / 8;
@@ -776,10 +955,15 @@ __global__ void __launch_bounds__(kThreads, H20V2_CPS)
             *reinterpret_cast<uint4 *>(a.out + size_t(t) * H + h8) = make_uint4(pk[0], pk[1], pk[2], pk[3]);
         }
     }
+#endif
 
 exit_kernel:
     __syncthreads();
     st_[5] = gtime();
+#if H20V2_GIN_DEVICE
+    st_[15] = s_put_t;
+    st_[13] = s_wait_ns;
+#endif
     if (a.stamps && threadIdx.x == 0)
         for (int u = 0; u < 16; ++u) a.stamps[blockIdx.x * 16 + u] = st_[u];
     if (threadIdx.x == 0) {
@@ -905,7 +1089,7 @@ std::vector<int64_t> counters() {
 
 void run(torch::Tensor x, torch::Tensor x_sf, torch::Tensor topk_ids, torch::Tensor topk_w, torch::Tensor out,
          torch::Tensor w13, torch::Tensor rs13, torch::Tensor w2, torch::Tensor rs2, double clamp, int64_t tile_tokens,
-         c10::optional<torch::Tensor> stamps) {
+         c10::optional<torch::Tensor> stamps, std::vector<int64_t> gin) {
     TORCH_CHECK(topk_ids.scalar_type() == torch::kInt64 && topk_w.scalar_type() == torch::kFloat32 &&
                 x_sf.scalar_type() == torch::kFloat32, "topk_ids int64, topk_w / x_sf fp32");
     Args a{};
@@ -932,7 +1116,15 @@ void run(torch::Tensor x, torch::Tensor x_sf, torch::Tensor topk_ids, torch::Ten
         a.peers.route[w] = reinterpret_cast<int *>(b + g.off_route);
         a.peers.route_flag[w] = reinterpret_cast<int *>(b + g.off_rtflag);
     }
-    a.T = int(x.size(0));
+    a.T = a.Town = int(x.size(0));
+    if (!gin.empty()) {  // [dev_comm, win, base, node, max_own, contexts]: EP16 over 2T rows
+        TORCH_CHECK(H20V2_GIN && gin.size() == 6, "EP16 needs the GIN build and its 6 session values");
+        a.gin = deep_gemm::H20Ep16Gin{reinterpret_cast<const void *>(gin[0]), reinterpret_cast<void *>(gin[1]),
+                                      reinterpret_cast<uint8_t *>(gin[2]), uint32_t(gin[3]), uint32_t(a.Town),
+                                      uint32_t(gin[4]), uint32_t(gin[5])};
+        TORCH_CHECK(a.Town <= int(gin[4]) && a.Town <= 256, "EP16: own rows exceed the window (or 256 signals)");
+        a.T = 2 * a.Town;
+    }
     TORCH_CHECK(a.T <= g.TCAP, "T exceeds TCAP");
     a.H = g.H, a.I = g.I, a.EL = g.EL, a.W = g.world, a.TOPK = g.TOPK, a.TCAP = g.TCAP, a.rank = g.rank;
     a.clamp = float(clamp);

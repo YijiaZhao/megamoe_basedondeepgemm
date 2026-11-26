@@ -347,10 +347,32 @@ kernel, with the forced-balanced routing written by one memcpy node in between (
 B200 rows were measured in the same Slurm job and container; upstream DeepGEMM has no Hopper MegaMoE and no FP4-activation (W4A4)
 MegaMoE, so those kernels have no upstream counterpart.
 
-H20 second shape (H4096 / I1536 / E640 / top-8, MXFP4, cold L2, 1830 MHz): EP8 with the v2 kernel
-(`deep_gemm.mega.h20_v2`) 77.4 / 106.2 / 161.1 / 281.5 / 337.2 µs at global M = 8 / 16 / 32 / 64 / 80, 337-338 µs
-(70% MBU) up to M = 128; two-node EP16 (fused kernel, NCCL GIN) 290.1 µs at M = 128. Every M = 8..128 point, method
-and correctness: [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md#h4096--i1536--e640--top-8-ep8-and-two-node-ep16-2026-11-25).
+H20 second shape: H4096 / I1536 / E640 / top-8, MXFP4, `deep_gemm.mega.h20_v2`, cold L2, µs (max over ranks of the
+per-rank median). EP8: one host, NVLink P2P, 1830 MHz. EP16: two hosts, cross-node exchange over NCCL GIN inside the
+kernel, 1830 MHz. GC MoE ([Bruce-Lee-LY/gc-moe](https://github.com/Bruce-Lee-LY/gc-moe) `sm90_fp8_fp4_gc_moe`, b731747):
+its own benchmark script with the same shape and balanced routing, CUDA graph, cold L2, 1830 MHz; it runs within one
+host (peer-accessible GPUs) only, so it has no EP16 column.
+
+| Global M (all ranks) | EP8 tokens/rank | EP8 | GC MoE EP8 | EP16 |
+|---:|---:|---:|---:|---:|
+| 8 | 1 | 77.4 | 91.5 | 99.0 |
+| 16 | 2 | 106.2 | 110.3 | 114.6 |
+| 24 | 3 | 136.0 | 150.7 | 123.6 |
+| 32 | 4 | 161.1 | 189.8 | 142.5 |
+| 40 | 5 | 190.8 | 208.3 | 159.6 |
+| 48 | 6 | 223.0 | 238.1 | 172.3 |
+| 56 | 7 | 251.0 | 268.4 | 181.3 |
+| 64 | 8 | 281.5 | 294.3 | 195.3 |
+| 72 | 9 | 307.7 | 324.9 | 223.4 |
+| 80 | 10 | 337.2 | 353.2 | 232.6 |
+| 88 | 11 | 337.3 | 353.5 | 232.4 |
+| 96 | 12 | 337.3 | 352.1 | 232.4 |
+| 104 | 13 | 337.4 | 374.7 | 234.0 |
+| 112 | 14 | 338.5 | 354.3 | 233.2 |
+| 120 | 15 | 337.9 | 354.6 | 235.0 |
+| 128 | 16 | 338.1 | 353.3 | 235.7 |
+
+Method and correctness: [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md#h4096--i1536--e640--top-8-ep8-and-two-node-ep16-2026-11-25).
 
 SM120 (8x RTX 6000D, PCIe P2P, no NVLink; host: [SM120 test host](#sm120-test-host-8x-rtx-6000d)): `fp4_mega_moe_sm120`,
 one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4, over PCIe P2P or, for peers on

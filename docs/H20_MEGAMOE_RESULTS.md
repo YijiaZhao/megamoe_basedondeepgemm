@@ -107,40 +107,45 @@ Env knobs of this tree (all read once per process; the table above uses the defa
 Hidden 4096, intermediate 1536, 640 experts (80 per rank in EP8, 40 per rank in EP16), top-8, MXFP4. EP8: the v2
 kernel (`deep_gemm.mega.h20_v2.mxfp4_mega_moe_h20_v2`, `sm90_fp4_mega_moe_h20_v2.cu`: two independent CTAs per SM,
 each two RS-wgmma warpgroups + a producer warp streaming weight blocks (bulk copy) and token blocks (TMA, 128B swizzle)
-through a 4-stage ring, epoch flags instead of cross-rank barriers). EP16: the fused kernel (`mxfp4_mega_moe_fused`,
-NCCL GIN), not ported to v2 yet. Global M = tokens before top-k summed over all ranks; the test spreads them evenly
+through a 4-stage ring, epoch flags instead of cross-rank barriers). EP16: the same v2 kernel per node over 2T rows (`deep_gemm.mega.h20_v2.H20V2EP16`): it first puts its T rows to the rail
+peer (same local rank on the other node) with one NCCL GIN put and runs the node's 320 experts over its own and the
+peer's rows; the combine sums the peer's rows per 256-column chunk and puts each row back (one GIN signal per row), the
+own rows add the peer's partial once its signal arrives. Global M = tokens before top-k summed over all ranks; the test spreads them evenly
 (`--global-tokens M`: rank r gets rows [M·r/W, M·(r+1)/W)).
 
-| Global M (all ranks) | EP8 tokens/rank | EP8 µs | EP8 MBU | EP16 tokens/rank | EP16 µs | EP16 MBU |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 1 | 77.4 | 30.5% | 0.5 | 110.0 | 10.7% |
-| 16 | 2 | 106.2 | 44.4% | 1 | 129.4 | 18.2% |
-| 24 | 3 | 136.0 | 52.0% | 1.5 | 150.2 | 23.6% |
-| 32 | 4 | 161.1 | 58.6% | 2 | 171.9 | 27.5% |
-| 40 | 5 | 190.8 | 61.8% | 2.5 | 193.7 | 30.5% |
-| 48 | 6 | 223.0 | 63.5% | 3 | 211.9 | 33.4% |
-| 56 | 7 | 251.0 | 65.8% | 3.5 | 234.1 | 35.3% |
-| 64 | 8 | 281.5 | 67.1% | 4 | 260.2 | 36.3% |
-| 72 | 9 | 307.7 | 69.0% | 4.5 | 277.8 | 38.2% |
-| 80 | 10 | 337.2 | 70.0% | 5 | 301.4 | 39.1% |
-| 88 | 11 | 337.3 | 69.9% | 5.5 | 300.0 | 39.3% |
-| 96 | 12 | 337.3 | 69.9% | 6 | 302.8 | 39.0% |
-| 104 | 13 | 337.4 | 69.9% | 6.5 | 303.2 | 38.9% |
-| 112 | 14 | 338.5 | 69.7% | 7 | 303.9 | 38.8% |
-| 120 | 15 | 337.9 | 69.8% | 7.5 | 286.5 | 41.2% |
-| 128 | 16 | 338.1 | 69.8% | 8 | 290.1 | 40.7% |
+| Global M (all ranks) | EP8 tokens/rank | EP8 µs | EP8 MBU | GC MoE EP8 µs | EP16 tokens/rank | EP16 µs | EP16 MBU |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 1 | 77.4 | 30.5% | 91.5 | 0.5 | 99.0 | 11.9% |
+| 16 | 2 | 106.2 | 44.4% | 110.3 | 1 | 114.6 | 20.6% |
+| 24 | 3 | 136.0 | 52.0% | 150.7 | 1.5 | 123.6 | 28.6% |
+| 32 | 4 | 161.1 | 58.6% | 189.8 | 2 | 142.5 | 33.1% |
+| 40 | 5 | 190.8 | 61.8% | 208.3 | 2.5 | 159.6 | 37.0% |
+| 48 | 6 | 223.0 | 63.5% | 238.1 | 3 | 172.3 | 41.1% |
+| 56 | 7 | 251.0 | 65.8% | 268.4 | 3.5 | 181.3 | 45.5% |
+| 64 | 8 | 281.5 | 67.1% | 294.3 | 4 | 195.3 | 48.3% |
+| 72 | 9 | 307.7 | 69.0% | 324.9 | 4.5 | 223.4 | 47.5% |
+| 80 | 10 | 337.2 | 70.0% | 353.2 | 5 | 232.6 | 50.7% |
+| 88 | 11 | 337.3 | 69.9% | 353.5 | 5.5 | 232.4 | 50.8% |
+| 96 | 12 | 337.3 | 69.9% | 352.1 | 6 | 232.4 | 50.8% |
+| 104 | 13 | 337.4 | 69.9% | 374.7 | 6.5 | 234.0 | 50.4% |
+| 112 | 14 | 338.5 | 69.7% | 354.3 | 7 | 233.2 | 50.6% |
+| 120 | 15 | 337.9 | 69.8% | 354.6 | 7.5 | 235.0 | 50.2% |
+| 128 | 16 | 338.1 | 69.8% | 353.3 | 8 | 235.7 | 50.0% |
 
-Method (`tests/test_h20_ep16.py`, EP8 `--impl v2`): forced-balanced routing, one CUDA graph per call, 256 MiB written before every
+Method (`tests/test_h20_ep16.py --impl v2`): forced-balanced routing, one CUDA graph per call, 256 MiB written before every
 replay (cold L2), CUDA-event span of the replay, median of 30 replays per rank, max over the ranks. Inputs are
-already quantised (FP8 rows + K128 scales, top-k ids / weights) in device tensors (fused: in the symmetric buffer); no
+already quantised (FP8 rows + K128 scales, top-k ids / weights) in device tensors; no
 frontend, no input quantisation in the span. EP8: the one v2 kernel launch, NVLink P2P (cudaIpc) only, clocks locked
-at 1830 MHz. EP16: `--transport gin`, the one fused kernel per node with the cross-node exchange
-inside it (NCCL GIN, GDAKI backend, rail peer = same local rank on the other node); its clocks were not locked on
-every host. EP16 rows below 1 token per rank: half of the ranks have 1 row, the others 0. Push dispatch is not
-implemented over GIN, so every EP16 point uses the pull dispatch. MBU = weight bytes of the experts hit (FP4 payload +
+at 1830 MHz. EP16: `--transport gin --impl v2`, the one v2 launch per rank with the cross-node exchange inside it
+(NCCL GIN, GDAKI backend), two hosts, clocks locked at 1830 MHz. EP16 rows below 1 token per rank: half of the ranks have 1 row, the others 0. MBU = weight bytes of the experts hit (FP4 payload +
 scales as stored) / (ranks × 4.0 TB/s × time).
 
-Correctness: every point above, 2 seeds each, against the exact-quantised reference (FP8 activations, dequantised
+GC MoE: [Bruce-Lee-LY/gc-moe](https://github.com/Bruce-Lee-LY/gc-moe) `sm90_fp8_fp4_gc_moe` (b731747), its own
+`benchmarks/benchmark_sm90_gc_moe.py` with this shape and its routing replaced by the same forced-balanced routing, `--inner-iters 1` (L2 flushed
+before every replay; the script's default 100 flushes once per 100 replays), clocks locked at 1830 MHz. It needs
+peer-accessible GPUs (one host), so it has no EP16 column.
+
+Correctness: every EP8 / EP16 point above, 2 seeds each, against the exact-quantised reference (FP8 activations, dequantised
 weights, quantised intermediate): cos_min >= 0.99993; norm ratio 0.9997-1.0000.
 
 ```bash
@@ -149,6 +154,6 @@ torchrun --standalone --nproc-per-node 8 tests/test_h20_ep16.py --mode ep8 --qua
   --hidden 4096 --intermediate 1536 --experts 640 --topk 8 --global-tokens 64
 # EP16 (two hosts, node rank 0 / 1)
 torchrun --nnodes 2 --node-rank <0|1> --nproc-per-node 8 --master-addr <node0> --master-port 29655 \
-  tests/test_h20_ep16.py --mode ep16 --quant mxfp4 --transport gin \
+  tests/test_h20_ep16.py --mode ep16 --quant mxfp4 --transport gin --impl v2 \
   --hidden 4096 --intermediate 1536 --experts 640 --topk 8 --global-tokens 128
 ```
