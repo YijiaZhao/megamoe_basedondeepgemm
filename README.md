@@ -349,7 +349,8 @@ MegaMoE, so those kernels have no upstream counterpart.
 
 H20 second shape: H4096 / I1536 / E640 / top-8, MXFP4, `deep_gemm.mega.h20_v2`, cold L2, µs (max over ranks of the
 per-rank median). EP8: one host, NVLink P2P, 1830 MHz. EP16: two hosts, cross-node exchange over NCCL GIN inside the
-kernel, 1830 MHz. GC MoE ([Bruce-Lee-LY/gc-moe](https://github.com/Bruce-Lee-LY/gc-moe) `sm90_fp8_fp4_gc_moe`, b731747):
+kernel, 1830 MHz. GC MoE ([Bruce-Lee-LY/gc-moe](https://github.com/Bruce-Lee-LY/gc-moe) `sm90_fp8_fp4_gc_moe`, commit
+[`b7317477ace99fbe399e0b73eea9329fa6595261`](https://github.com/Bruce-Lee-LY/gc-moe/commit/b7317477ace99fbe399e0b73eea9329fa6595261) (2026-11-24, "feat: add gc moe k3")):
 its own benchmark script with the same shape and balanced routing, CUDA graph, cold L2, 1830 MHz; it runs within one
 host (peer-accessible GPUs) only, so it has no EP16 column.
 

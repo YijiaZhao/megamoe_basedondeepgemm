@@ -140,7 +140,8 @@ at 1830 MHz. EP16: `--transport gin --impl v2`, the one v2 launch per rank with 
 (NCCL GIN, GDAKI backend), two hosts, clocks locked at 1830 MHz. EP16 rows below 1 token per rank: half of the ranks have 1 row, the others 0. MBU = weight bytes of the experts hit (FP4 payload +
 scales as stored) / (ranks × 4.0 TB/s × time).
 
-GC MoE: [Bruce-Lee-LY/gc-moe](https://github.com/Bruce-Lee-LY/gc-moe) `sm90_fp8_fp4_gc_moe` (b731747), its own
+GC MoE: [Bruce-Lee-LY/gc-moe](https://github.com/Bruce-Lee-LY/gc-moe) `sm90_fp8_fp4_gc_moe` at commit
+[`b7317477ace99fbe399e0b73eea9329fa6595261`](https://github.com/Bruce-Lee-LY/gc-moe/commit/b7317477ace99fbe399e0b73eea9329fa6595261) (2026-11-24, "feat: add gc moe k3"), its own
 `benchmarks/benchmark_sm90_gc_moe.py` with this shape and its routing replaced by the same forced-balanced routing, `--inner-iters 1` (L2 flushed
 before every replay; the script's default 100 flushes once per 100 replays), clocks locked at 1830 MHz. It needs
 peer-accessible GPUs (one host), so it has no EP16 column.
