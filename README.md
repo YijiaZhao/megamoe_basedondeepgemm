@@ -33,9 +33,21 @@ The RTX 6000D rows are timed with CUDA events instead of nsys: CUDA graph replay
 | Where the time is read (nsys) | L1 kernel start -> L2 kernel end, launch gap included | one kernel start -> end |
 | Frontend (router + quant + top-8) | separate kernel, both models | same |
 
-The fused kernel saves the launch boundary and overlaps L1 tails with L2 starts and L2 tails with the combine. Both
-split APIs pass the same 8-rank exact-quantised-reference gate as the fused ones
-(`delivery/four_api_correctness_h20_20260903.txt`: cos_min >= 0.99991, norm ratio 0.997-1.0000, all four APIs PASS). Correctness of the B200 kernels: relative RMSE 0.23-0.25 % on every rank
+Same node, same session, Mega-only, GPU 0, median of the last 3 replays
+(`delivery/four_api_fable_timeline_last3_r4_20260909.md`; the fused kernel of that date, before its later optimisations):
+
+| Precision | M | Split (2 kernels) | Fused (1 kernel) |
+|---|---:|---:|---:|
+| MXFP4 | 2 | 53.9 | 46.9 |
+| MXFP4 | 8 | 97.3 | 59.1 |
+| MXFP4 | 16 | 147.8 | 74.0 |
+| QoQ | 2 | 49.5 | 43.8 |
+| QoQ | 8 | 88.0 | 54.9 |
+
+The split path was not optimised after 2026-09-03; the launch boundary alone is worth 6-7 µs at M = 2, and the fused
+kernel additionally overlaps L1 tails with L2 starts and L2 tails with the combine. Both split APIs pass the same 8-rank
+exact-quantised-reference gate as the fused ones (`delivery/four_api_correctness_h20_20260903.txt`: cos_min >= 0.99991,
+norm ratio 0.997-1.0000, all four APIs PASS). Correctness of the B200 kernels: relative RMSE 0.23-0.25 % on every rank
 against a pure-torch reference at every M (see the B200 document).
 
 ## Optimisation approach
@@ -89,6 +101,12 @@ no cross-rank wait is included; ~39 µs total):
 What GPU 0 reads on top of that (5–9 µs) is the wait for the other ranks to enter the kernel, i.e. launch skew outside
 the kernel.
 
+**Tried and dropped** (each measured on 8 ranks, details and numbers in the B200 document): half-N tiles (BLOCK_N 64,
+twice the tasks; a task is not shorter, the per-stage overhead dominates), split-K for the second L1 wave (correct;
+the dense slot map loses the early weight streaming and the half tasks compete with the W2 prefetch for HBM), fusing
+L1 and L2 into one task with the SwiGLU output kept on chip (bounded by the L2 phase minus the extra W2 streaming per
+task, ~1.5–2 µs at best; blocked on B200 by a tensor-core stall, measured slower on H20), per-token fine combine on
+B200, `cp.async` token tiles, one SF TMA per K block, deterministic dispatch slots, per-warpgroup L1 -> L2 signalling.
 FlashInfer's CuTeDSL MegaMoE (SM100 NVFP4) uses the same single-kernel structure with the FC1 output through a global
 buffer; its 128-token tiles leave it at DeepGEMM-upstream parity for this batch size.
 

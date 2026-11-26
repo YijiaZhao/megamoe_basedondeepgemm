@@ -1,5 +1,6 @@
 # H20 MegaMoE results (8x H20-3e)
 
+Moved verbatim from the README of 2026-09-13; the measurement method, pass counts and scripts are as described here.
 Back to the [README](../README.md); Blackwell results: [B200_MEGAMOE_RESULTS.md](B200_MEGAMOE_RESULTS.md).
 
 ## Performance results (2026-09-13)
@@ -9,15 +10,22 @@ fused backend (`mxfp4_mega_moe_fused` / `qoq_mega_moe_fused`); GPU 0, median of 
 replays, median over the clean passes (inter-rank Mega-start skew <= 20 us; pass counts in the
 measurement method).
 
-| | Precision | M2 | M4 | M8 | M16 |
-|---|---|---:|---:|---:|---:|
-| E2E, normal routing | MXFP4 | 53.4 | 59.4 | 67.8 | 80.8 |
-| E2E, normal routing | QoQ | 51.8 | 59.1 | 66.4 | 79.6 |
-| E2E, forced-balanced | MXFP4 | 44.6 | 54.0 | 62.2 | 80.9 |
-| E2E, forced-balanced | QoQ | 44.8 | 54.2 | 60.4 | 80.6 |
-| Mega-only, balanced | MXFP4 | 38.8 | 47.4 | 56.7 | 76.2 |
-| Mega-only, balanced | QoQ | 37.1 | 45.2 | 54.0 | 72.6 |
-| FE kernel | both | 2.8 | 2.8–2.9 | 2.7–2.8 | 3.0–3.1 |
+| | Precision | 0-token rows | M2 | M4 | M8 | M16 |
+|---|---|---|---:|---:|---:|---:|
+| E2E, normal routing | MXFP4 | 0-token rows ROUTED (no skip) | 64.0 | 64.4 | 68.0 | 80.9 |
+| E2E, normal routing | MXFP4 | **0-token rows UNROUTED (skip, default)** | 53.4 | 59.4 | 67.8 | 80.8 |
+| E2E, normal routing | QoQ | 0-token rows ROUTED (no skip) | 62.3 | 61.8 | 66.5 | 79.7 |
+| E2E, normal routing | QoQ | **0-token rows UNROUTED (skip, default)** | 51.8 | 59.1 | 66.4 | 79.6 |
+| E2E, forced-balanced | MXFP4 | 0-token rows ROUTED (no skip) | 45.0 | 53.9 | 63.0 | 80.7 |
+| E2E, forced-balanced | MXFP4 | **0-token rows UNROUTED (skip, default)** | 44.6 | 54.0 | 62.2 | 80.9 |
+| E2E, forced-balanced | QoQ | 0-token rows ROUTED (no skip) | 44.4 | 54.2 | 60.9 | 80.3 |
+| E2E, forced-balanced | QoQ | **0-token rows UNROUTED (skip, default)** | 44.8 | 54.2 | 60.4 | 80.6 |
+| Mega-only, balanced | MXFP4 | - | 38.8 | 47.4 | 56.7 | 76.2 |
+| Mega-only, balanced | QoQ | - | 37.1 | 45.2 | 54.0 | 72.6 |
+| FE kernel | both | 0-token rows ROUTED (no skip) | 2.5–2.7 | 2.5–2.7 | 2.5–2.7 | 2.8–3.0 |
+| FE kernel | both | **0-token rows UNROUTED (skip, default)** | 2.8 | 2.8–2.9 | 2.7–2.8 | 3.0–3.1 |
+
+0-token rows: at M2 / M4 only the ranks that own a token have a real input row; the other ranks' row is all-zero padding (a "0-token row"). **0-token rows ROUTED** = `DG_FE_ZERO_ROW_UNROUTED=0`, the frontend treats the 0-token row like a real token and routes it (to experts 0..7 on rank 0), so the MegaMoE does useless work for it. **0-token rows UNROUTED** = the default `DG_FE_ZERO_ROW_UNROUTED=1`, the frontend detects the all-zero row and marks it as not routed; the MegaMoE dispatches nothing for it and writes a zero output (exact: x = 0 gives y = 0). Only the normal-routing rows at M2 / M4 are affected.
 
 Rows: **E2E** = frontend kernel + fused MegaMoE kernel in one CUDA graph, span from the frontend
 start to the MegaMoE end; **normal routing** = the frontend's real top-8 of random hidden rows;
@@ -34,8 +42,8 @@ reduce-scatter and the TP4 all-gather sit between the replays, outside the graph
 (`nvidia-smi -lgc 1830,1830`, verified by the capture script), container `fe5c_build` (the
 pinned image above). All rows: `main` `9d2f7e9` (one build, `_C` extension sha256 `3acb4e2`;
 the default code paths of this tree), one session 2026-09-13 05:27-07:44 UTC: 5 interleaved
-passes (per pass: E2E normal, E2E forced-balanced, Mega-only, plus the campaign's non-default routed-padding
-cases, not reported; `tests/fe5_campaign_zr_interleave.sh`) plus 3 extra E2E
+passes (per pass: E2E normal routed, E2E normal unrouted, E2E forced-balanced routed, E2E
+forced-balanced unrouted, Mega-only; `tests/fe5_campaign_zr_interleave.sh`) plus 3 extra E2E
 passes for the cells with fewer than 3 clean passes; a cell is the median over its clean passes,
 i.e. the passes whose last 3 replays all have an inter-rank Mega-start skew <= 20 us (E2E and FE:
 5-8 clean of 8 passes per cell at M4 / M8 / M16, 2-7 of 8 at M2; Mega-only: 5 of 5).
@@ -49,7 +57,8 @@ GPU 0, takes the last 3 replays, measures each span (E2E: frontend kernel start 
 end; Mega-only: kernel start -> end; FE: frontend kernel start -> end) and reports their median;
 `tests/fe5_summarize_campaign.py` takes the median over the passes (Mega-only: 5 passes). Env of
 the runs: `DG_FE_SELECT_IN_MEGA=1 DG_PROFILE_STREAMED=1 DG_PROFILE_ITERS=30`, plus
-`DG_PROFILE_FORCE_BALANCED=1` for the forced-balanced rows; every other knob at its library default.
+`DG_PROFILE_FORCE_BALANCED=1` for the forced-balanced rows and `DG_FE_ZERO_ROW_UNROUTED=0` for the
+routed rows; every other knob at its library default.
 
 Reproduce (inside the container, repo root; 8 idle GPUs, clock locked):
 
