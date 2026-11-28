@@ -16,9 +16,9 @@ GPU 0, median of the last 3 of 30 streamed replays, µs at global M = 2 / 4 / 8 
 | 8x B200 (1965 MHz) | W-MXFP4 x A-FP8, `sm100_b200/` | 35.7 | 38.9 | 46.1 | 54.0 |
 | 8x H20-3e (1830 MHz) | MXFP4 fused | 38.8 | 47.4 | 56.7 | 76.2 |
 | 8x H20-3e (1830 MHz) | QoQ (W4A8-int) fused | 37.1 | 45.2 | 54.0 | 72.6 |
-| 8x RTX 6000D (PCIe P2P) | W4A8 (MXFP4 x MXFP8), `sm120_6000d/` | 43.6 | 57.7 | 78.6 | 116.3 |
-| 8x RTX 6000D (PCIe P2P) | W4A4 MXFP4, `sm120_6000d/` | 43.8 | 57.2 | 78.4 | 115.0 |
-| 8x RTX 6000D (PCIe P2P) | W4A4 NVFP4, `sm120_6000d/` | 46.8 | 60.8 | 81.3 | 120.8 |
+| 8x RTX 6000D (PCIe P2P) | W4A8 (MXFP4 x MXFP8), `sm120_6000d/` | 49.4 | 62.0 | 78.9 | 116.7 |
+| 8x RTX 6000D (PCIe P2P) | W4A4 MXFP4, `sm120_6000d/` | 48.5 | 61.0 | 78.0 | 115.9 |
+| 8x RTX 6000D (PCIe P2P) | W4A4 NVFP4, `sm120_6000d/` | 50.0 | 62.6 | 80.5 | 121.2 |
 
 The RTX 6000D rows are timed with CUDA events instead of nsys: CUDA graph replays, 256 MB written before each replay
 (cold L2), median of 30, clocks not locked. Their test host (PCIe and NIC topology) is described under
@@ -339,7 +339,7 @@ Per-platform result documents (one table + measurement method + reproduce each):
 | 8x B200 (SM100, 1965 MHz) | Upstream baseline: [deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) main `78b6900` W-MXFP4xA-FP8 `fp8xfp4` MegaMoE, kernel unmodified | 47.2 / 50.5 / 53.2 / 61.2 | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x B200 (SM100, 1965 MHz) | **E2E** (frontend kernel + forced-balanced memcpy + MegaMoE, one CUDA graph): W-MXFP4xA-FP8 / W4A4 MXFP4 / W4A4 NVFP4 | 44.0 / 48.5 / 53.8 / 63.0 (FP8 act), 40.8 / 44.8 / 51.5 / 58.9 (MXFP4), 41.7 / 46.4 / 52.3 / 60.0 (NVFP4) | [docs/B200_MEGAMOE_RESULTS.md](docs/B200_MEGAMOE_RESULTS.md) |
 | 8x H20-3e (SM90, 1830 MHz) | **E2E** (same graph, padding rows unrouted): MXFP4 / QoQ fused | 44.6 / 54.0 / 62.2 / 80.9 (MXFP4), 44.8 / 54.2 / 60.4 / 80.6 (QoQ) | [docs/H20_MEGAMOE_RESULTS.md](docs/H20_MEGAMOE_RESULTS.md) |
-| 8x RTX 6000D (SM120, PCIe P2P, clocks not locked) | W4A8 / W4A4 MXFP4 / W4A4 NVFP4 `fp4_mega_moe_sm120` (CUDA events, cold L2) | 43.6 / 57.7 / 78.6 / 116.3 (W4A8), 43.8 / 57.2 / 78.4 / 115.0 (MXFP4), 46.8 / 60.8 / 81.3 / 120.8 (NVFP4) | [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md) |
+| 8x RTX 6000D (SM120, PCIe P2P, clocks not locked) | W4A8 / W4A4 MXFP4 / W4A4 NVFP4 `fp4_mega_moe_sm120` (CUDA events, cold L2) | 49.4 / 62.0 / 78.9 / 116.7 (W4A8), 48.5 / 61.0 / 78.0 / 115.9 (MXFP4), 50.0 / 62.6 / 80.5 / 121.2 (NVFP4) | [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md) |
 
 Same model scale for all rows (E384 / 48 local, H3072, I1280, top-8, EP8) and the same forced-balanced routing; every column is the
 kernel span on GPU 0, median of the last 3 of 30 streamed replays (nsys on H20, torch-profiler kernel durations on B200;
@@ -381,7 +381,7 @@ SM120 (8x RTX 6000D, PCIe P2P, no NVLink; host: [SM120 test host](#sm120-test-ho
 one EP kernel for W4A8 (MXFP4 weights x MXFP8 activations) and W4A4 MXFP4 / NVFP4, over PCIe P2P or, for peers on
 another host, the NIC (NCCL GIN), up to 16 ranks. **Use it for decode-size batches: fewer than 256 tokens per rank and
 at most 128 tokens per local expert**; above that, use a grouped-GEMM MoE. This README's shape, EP8, cold L2
-(256 MB written before each replay), W4A8: 43.6 / 57.7 / 78.6 / 116.3 µs at M2 / 4 / 8 / 16; all formats, method and
+(256 MB written before each replay), W4A8: 49.4 / 62.0 / 78.9 / 116.7 µs at M2 / 4 / 8 / 16; all formats, method and
 correctness: [docs/SM120_MEGAMOE_RESULTS.md](docs/SM120_MEGAMOE_RESULTS.md); environment variables: [sm120_6000d/ENV.md](sm120_6000d/ENV.md).
 
 ## Relevant source files

@@ -67,6 +67,9 @@
 #ifndef SM120_FP4_A8
 #define SM120_FP4_A8 0
 #endif
+#ifndef SM120_XRING
+#define SM120_XRING 1
+#endif
 constexpr bool kNv = SM120_FP4_NV;
 constexpr bool kA8 = SM120_FP4_A8;
 static_assert(!(kNv && kA8));
@@ -146,6 +149,7 @@ struct Args {
     Gin gin;
     int T, H, I, EL, W, TOPK, TCAP, rank;
     float swiglu_limit;
+    bool xring;               // token rows 16 B aligned: items of >= 32 tokens stage them in shared memory
 };
 
 __device__ __forceinline__ uint64_t gtime() {
@@ -256,13 +260,187 @@ __device__ __forceinline__ void expand(uint32_t w, uint32_t &lo, uint32_t &hi) {
     hi = (w >> 2) & 0x3C3C3C3Cu;
 }
 
+__device__ __forceinline__ uint32_t sm_u32(const void *p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+    uint32_t ok;
+    do {
+        asm volatile("{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}"
+                     : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
+    } while (!ok);
+}
+
+// Activation ring (W4A8 items of 32 / 64 tokens, W4A4 of 64): the item's token rows reach shared memory a K256 step at a time, once per
+// CTA for its 8 warps (each read them from L1 / L2 before). Every warp copies its 1/8 of a stage with 16 B cp.async
+// (per-row TMA bulk copies are too slow at 128-256 B a row) and arrives on the stage's full barrier when they land;
+// every warp arrives on the stage's empty barrier once its MMAs are done with it, and a stage is refilled only after
+// all 8 have: no CTA-wide sync, a warp may run ahead of the slowest by up to S - 2 steps. Padding rows are not
+// copied (their MMA columns are never stored). Overlays s_tile.
+constexpr int kXRowB = 256 / kXB;   // one token row's bytes per K256 step
+constexpr int kXPad = kXRowB + 16;  // stage row stride
+__host__ __device__ constexpr int xstages(int nt) {
+    // W4A4 32-token items (two CTAs per SM) measured ~2% slower with it on 6000D: off there
+    return SM120_XRING ? (nt >= 8 ? (kA8 ? 3 : 4) : nt >= 4 && kA8 ? 3 : 0) : 0;
+}
+__host__ __device__ constexpr int xring_bytes(int nt) { return xstages(nt) * nt * kTile * kXPad; }
+struct XRing {
+    char *st;                    // [S][kT][kXPad]
+    uint64_t *full, *empty;      // [S] each
+    uint32_t seq;                // stage uses so far (the barriers' phases), the same in every thread
+    int ntok;                    // the item's tokens: the stage rows past it (padding) are not copied
+    bool on;                     // the rows are 16 B aligned (else the item reads them from global memory)
+};
+// item_gemm with the activation ring (xg.on, NT >= 4); the weights stay a register stream
+template <int NT>
+__device__ __forceinline__ void item_gemm_ring(float (&acc)[kNbPerWarp][NT][4], const uint4 *W, const uint32_t *WS,
+                                               int nb0, int K, const uint32_t *const (&xrow)[NT],
+                                               const uint32_t *const (&xsrow)[NT], int lane, XRing &xg) {
+    constexpr int kS = xstages(NT), kT = NT * kTile;
+    const int warp = threadIdx.x / 32, g = lane / 4, c = lane % 4;
+    const int kch = K / 64, kw = K / kSfWordK, nst = kch / kUnroll;
+    const uint4 *wp[kNbPerWarp];
+    const uint32_t *sp[kNbPerWarp];
+#pragma unroll
+    for (int j = 0; j < kNbPerWarp; ++j) {
+        wp[j] = W + size_t(nb0 + j) * kch * 32 + lane;
+        sp[j] = WS + size_t(nb0 + j) * kw * 16 + g + (lane & 1) * 8;
+    }
+#pragma unroll
+    for (int j = 0; j < kNbPerWarp; ++j)
+#pragma unroll
+        for (int s = 0; s < NT; ++s) acc[j][s][0] = acc[j][s][1] = acc[j][s][2] = acc[j][s][3] = 0.f;
+    constexpr int kSw = kNv ? kUnroll : kUnroll / 2;
+    uint4 wv[kNbPerWarp][kUnroll];
+    uint32_t sfa[kNbPerWarp][kSw];
+    auto load = [&](int k0, uint4 (&w)[kNbPerWarp][kUnroll], uint32_t (&sf)[kNbPerWarp][kSw]) {
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j) w[j][u] = __ldcs(wp[j] + (k0 + u) * 32);
+#pragma unroll
+        for (int q = 0; q < kSw; ++q)
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j) sf[j][q] = __ldg(sp[j] + (k0 * kSw / kUnroll + q) * 16);
+    };
+    // every warp fills its NT rows of each stage (rows warp * NT .., all of sub-tile warp * NT / 8) with 16 B cp.async:
+    // lane chunk m is the warp's row (lane + 32 m) / kCpr, 16 B column lane % kCpr
+    constexpr int kCpr = kXRowB / 16, kM = NT * kCpr / 32;
+    static_assert(32 % kCpr == 0 && kM >= 1, "chunks per lane");
+    const uint32_t *xw = xrow[0];
+#pragma unroll
+    for (int s = 1; s < NT; ++s)
+        if (s == warp * NT / kTile) xw = xrow[s];
+    const char *src[kM];
+    uint32_t doff[kM];
+    bool real[kM];
+#pragma unroll
+    for (int m = 0; m < kM; ++m) {
+        const int k = (lane + 32 * m) / kCpr, gq = (warp * NT) % kTile + k;  // the row's token in sub-tile warp*NT/8
+        src[m] = reinterpret_cast<const char *>(__shfl_sync(0xffffffffu, reinterpret_cast<unsigned long long>(xw), gq * 4)) +
+                 (lane % kCpr) * 16;
+        doff[m] = (warp * NT + k) * kXPad + (lane % kCpr) * 16;
+        real[m] = warp * NT + k < xg.ntok;
+    }
+    const uint32_t seq = xg.seq;
+    auto issue = [&](int i) {  // this warp's share of K256 step i -> stage use seq + i
+        const uint32_t u = seq + uint32_t(i), slot = u % kS;
+        if (u >= uint32_t(kS)) mbar_wait(sm_u32(xg.empty + slot), (u / kS - 1) & 1);
+        const uint32_t base = sm_u32(xg.st + slot * (kT * kXPad));
+#pragma unroll
+        for (int m = 0; m < kM; ++m)
+            if (real[m])
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(base + doff[m]),
+                             "l"(src[m] + size_t(i) * kXRowB)
+                             : "memory");
+        asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(sm_u32(xg.full + slot)) : "memory");
+    };
+    for (int i = 0; i < min(kS - 1, nst); ++i) issue(i);
+#pragma unroll 2
+    for (int i = 0; i < nst; ++i) {
+        const int k0 = i * kUnroll;
+        load(k0, wv, sfa);
+        const uint32_t u = seq + uint32_t(i), slot = u % kS;
+        mbar_wait(sm_u32(xg.full + slot), (u / kS) & 1);
+        const char *xst = xg.st + slot * (kT * kXPad);
+        uint4 av[kA8 ? 1 : NT][2];
+        uint32_t asf[kA8 ? 1 : NT][kSw];
+        if constexpr (!kA8) {
+#pragma unroll
+            for (int s = 0; s < NT; ++s) {
+                const uint4 *x4 = reinterpret_cast<const uint4 *>(xst + (s * kTile + g) * kXPad) + c * 2;
+                av[s][0] = x4[0];
+                av[s][1] = x4[1];
+                if constexpr (kNv) {
+                    const uint4 t = *reinterpret_cast<const uint4 *>(xsrow[s] + k0);
+                    asf[s][0] = t.x, asf[s][1] = t.y, asf[s][2 % kSw] = t.z, asf[s][3 % kSw] = t.w;
+                } else {
+                    const uint2 t = *reinterpret_cast<const uint2 *>(xsrow[s] + k0 / 2);
+                    asf[s][0] = t.x, asf[s][1 % kSw] = t.y;
+                }
+            }
+        }
+#pragma unroll
+        for (int u4 = 0; u4 < kUnroll; ++u4) {
+            const int kc = k0 + u4;
+            if constexpr (kA8) {
+                uint4 xv[NT];
+#pragma unroll
+                for (int s = 0; s < NT; ++s)
+                    xv[s] = *reinterpret_cast<const uint4 *>(xst + (s * kTile + g) * kXPad + (c * 16 + u4 * 4) * 4);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int step = kc * 2 + h;
+                    const uint16_t sel = uint16_t(step & 3);
+                    uint32_t b0[NT], b1[NT], sfb[NT];
+#pragma unroll
+                    for (int s = 0; s < NT; ++s) {
+                        b0[s] = h ? xv[s].z : xv[s].x;
+                        b1[s] = h ? xv[s].w : xv[s].y;
+                        sfb[s] = xsrow[s][kc / 2];
+                    }
+#pragma unroll
+                    for (int j = 0; j < kNbPerWarp; ++j) {
+                        uint32_t wa[4];
+                        expand(h ? wv[j][u4].z : wv[j][u4].x, wa[0], wa[1]);
+                        expand(h ? wv[j][u4].w : wv[j][u4].y, wa[2], wa[3]);
+#pragma unroll
+                        for (int s = 0; s < NT; ++s)
+                            mma_w4a8(acc[j][s], wa, b0[s], b1[s], sfa[j][u4 / 2], sel, sfb[s], sel);
+                    }
+                }
+                continue;
+            }
+            uint32_t b0[NT], b1[NT], sfb[NT];
+#pragma unroll
+            for (int s = 0; s < NT; ++s) {
+                b0[s] = u4 & 1 ? av[s][u4 / 2].z : av[s][u4 / 2].x;
+                b1[s] = u4 & 1 ? av[s][u4 / 2].w : av[s][u4 / 2].y;
+                sfb[s] = kNv ? asf[s][u4] : asf[s][u4 / 2] >> ((u4 & 1) * 16);
+            }
+#pragma unroll
+            for (int j = 0; j < kNbPerWarp; ++j) {
+                const uint32_t sa = kNv ? sfa[j][u4] : sfa[j][u4 / 2] >> ((u4 & 1) * 16);
+#pragma unroll
+                for (int s = 0; s < NT; ++s) mma_fp4(acc[j][s], wv[j][u4], b0[s], b1[s], sa, sfb[s]);
+            }
+        }
+        __syncwarp();
+        if (lane == 0) asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(sm_u32(xg.empty + slot)) : "memory");
+        if (i + kS - 1 < nst) issue(i + kS - 1);
+    }
+    xg.seq = seq + uint32_t(nst);
+}
+
 // warp GEMM over one 128-row item and NT n8 token sub-tiles: acc[j][s] = rows (nb0+j)*16 + {g, g+8}, cols = tokens
 // s*8 + 2c, 2c+1. Each weight fragment is loaded once (streaming load) and feeds NT MMAs.
 // xrow[s]: this lane's token row of sub-tile s (K/kXB bytes, as words), xsrow[s]: its scale words (K/kSfWordK).
 template <int NT>
 __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NT][4], const uint4 *W, const uint32_t *WS, int nb0,
                                           int K, const uint32_t *const (&xrow)[NT], const uint32_t *const (&xsrow)[NT],
-                                          int lane) {
+                                          int lane, XRing &xg) {
+    constexpr int kS = xstages(NT);
+    if constexpr (kS > 0) {
+        if (xg.on) return item_gemm_ring<NT>(acc, W, WS, nb0, K, xrow, xsrow, lane, xg);
+    }
     const int g = lane / 4, c = lane % 4;
     const int kch = K / 64, kw = K / kSfWordK;
     const uint4 *wp[kNbPerWarp];
@@ -517,9 +695,16 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
     float (*s_tile)[kRowsPerItem] = reinterpret_cast<float (*)[kRowsPerItem]>(s_dyn);
 
     unsigned long long st_[16] = {gtime()};  // 0 start 1 pushed 2 flags 3 work end 4 comb flags 5 end 6 L1-wait ns 7 items 8 route-push 9 route-ok 10 map 11 pf 12 flag-sent 13 last FC1 14 first FC2 15 comb release
+    __shared__ __align__(8) uint64_t s_xfull[xstages(NT) > 0 ? xstages(NT) : 1], s_xempty[xstages(NT) > 0 ? xstages(NT) : 1];
+    XRing xg{reinterpret_cast<char *>(s_dyn), s_xfull, s_xempty, 0u, 0, a.xring};
     if (threadIdx.x == 0) {
         s_epoch = *reinterpret_cast<volatile int *>(a.ctr + kCtrEpoch) + 1;
         s_ok = 1;  // cleared by a timed-out wait
+        for (int st = 0; st < xstages(NT); ++st) {
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(sm_u32(&s_xfull[st])), "r"(kWarps * 32));
+            asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(sm_u32(&s_xempty[st])), "r"(kWarps));
+        }
+        if (xstages(NT) > 0) asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
     const int epoch = s_epoch;
@@ -815,6 +1000,7 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
             while (m.tiles_prefix[el + 1] <= tile_g) ++el;
             const int tile = tile_g - m.tiles_prefix[el];
             const int ntok = min(kT, m.ne[el] - tile * kT);
+            xg.ntok = ntok;
             int js[NT];  // this lane's token of sub-tile s (B column g; past the end: the tile's first token)
 #pragma unroll
             for (int s = 0; s < NT; ++s) js[s] = tile * kT + (s * kTile + g < ntok ? s * kTile + g : 0);
@@ -846,7 +1032,8 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
                     xr[s] = reinterpret_cast<const uint32_t *>(row);
                     xs[s] = reinterpret_cast<const uint32_t *>(row + H / kXB);
                 }
-                item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane);
+                item_gemm<NT>(acc, a.w13 + el * w13_expert, a.ws13 + el * ws13_expert, nb0, H, xr, xs, lane, xg);
+                if (xstages(NT) > 0) __syncthreads();  // every warp is done with the ring (s_tile overlays it)
                 const float alpha = kNv ? a.gscale[0] * a.gscale[2 + el] : 1.f;
                 // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
                 constexpr int kItemInter = kRowsPerItem / 2;
@@ -889,7 +1076,8 @@ __global__ void __launch_bounds__(kWarps * 32, NT >= 8 ? 1 : 2) sm120_fp4_mega_m
                     xr[s] = reinterpret_cast<const uint32_t *>(a.inter + r * (I / kXB));
                     xs[s] = a.inter_s + r * (I / kSfWordK);
                 }
-                item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane);
+                item_gemm<NT>(acc, a.w2 + el * w2_expert, a.ws2 + el * ws2_expert, nb0, I, xr, xs, lane, xg);
+                if (xstages(NT) > 0) __syncthreads();
                 const float alpha = kNv ? a.gscale[1] * a.gscale[2 + EL + el] : 1.f;
 #pragma unroll
                 for (int jb = 0; jb < kNbPerWarp; ++jb) {
@@ -1266,7 +1454,9 @@ struct State {
 };
 static State g;
 
-constexpr int tile_smem(int nt) { return nt * kTile * kRowsPerItem * 4; }  // the kernel's s_tile
+constexpr int tile_smem(int nt) {  // the kernel's s_tile, the activation ring overlaid
+    return nt * kTile * kRowsPerItem * 4 > xring_bytes(nt) ? nt * kTile * kRowsPerItem * 4 : xring_bytes(nt);
+}
 
 template <int NT>
 static int grid_for(int sms) {
@@ -1423,6 +1613,7 @@ void run(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_w, torch::T
     TORCH_CHECK(a.T <= g.TCAP, "T exceeds TCAP");
     a.H = g.H, a.I = g.I, a.EL = g.EL, a.W = g.world, a.TOPK = g.TOPK, a.TCAP = g.TCAP, a.rank = g.rank;
     a.swiglu_limit = float(swiglu_limit);
+    a.xring = pool_rx(g.H) % 16 == 0;
     // tokens per item: 0 = from the expected tokens per local expert e (this rank's T, uniform routing)
     int nt = int(tile_tokens) / kTile;
     if (tile_tokens <= 0) {
